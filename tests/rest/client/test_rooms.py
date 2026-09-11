@@ -25,13 +25,15 @@
 
 import json
 from http import HTTPStatus
-from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, Union
-from unittest.mock import AsyncMock, Mock, call, patch
+from typing import Any, Iterable, Literal
+from unittest.mock import AsyncMock, Mock, call, create_autospec, patch
 from urllib import parse as urlparse
 
 from parameterized import param, parameterized
 
-from twisted.test.proto_helpers import MemoryReactor
+from twisted.internet import defer
+from twisted.internet.testing import MemoryReactor
+from twisted.web.client import Agent
 
 import synapse.rest.admin
 from synapse.api.constants import (
@@ -43,8 +45,9 @@ from synapse.api.constants import (
     RoomTypes,
 )
 from synapse.api.errors import Codes, HttpResponseException
+from synapse.api.room_versions import RoomVersions
 from synapse.appservice import ApplicationService
-from synapse.events import EventBase
+from synapse.events import EventBase, make_event_from_dict
 from synapse.events.snapshot import EventContext
 from synapse.rest import admin
 from synapse.rest.client import (
@@ -58,14 +61,19 @@ from synapse.rest.client import (
     sync,
 )
 from synapse.server import HomeServer
-from synapse.types import JsonDict, RoomAlias, UserID, create_requester
-from synapse.util import Clock
+from synapse.types import JsonDict, JsonMapping, RoomAlias, UserID, create_requester
+from synapse.util.clock import Clock
+from synapse.util.duration import Duration
 from synapse.util.stringutils import random_string
 
 from tests import unittest
 from tests.http.server._base import make_request_with_cancellation_test
 from tests.storage.test_stream import PaginationTestCase
-from tests.test_utils.event_injection import create_event
+from tests.test_utils import FakeResponse
+from tests.test_utils.event_injection import (
+    create_event,
+    inject_event,
+)
 from tests.unittest import override_config
 from tests.utils import default_config
 
@@ -73,7 +81,7 @@ PATH_PREFIX = b"/_matrix/client/api/v1"
 
 
 class RoomBase(unittest.HomeserverTestCase):
-    rmcreator_id: Optional[str] = None
+    rmcreator_id: str | None = None
 
     servlets = [room.register_servlets, room.register_deprecated_servlets]
 
@@ -499,7 +507,8 @@ class RoomPermissionsTestCase(RoomBase):
             )
         )
         assert pl_event is not None
-        self.assertEqual(50, pl_event.content.get("m.call.invite"))
+        self.assertEqual(50, pl_event.content.get("events", {}).get("m.call.invite"))
+        self.assertEqual(50, pl_event.content.get("events", {}).get("m.room.name"))
 
         private_pl_event = self.get_success(
             self.store_controllers.state.get_current_state_event(
@@ -507,7 +516,9 @@ class RoomPermissionsTestCase(RoomBase):
             )
         )
         assert private_pl_event is not None
-        self.assertEqual(None, private_pl_event.content.get("m.call.invite"))
+        self.assertEqual(
+            None, private_pl_event.content.get("events", {}).get("m.call.invite")
+        )
 
 
 class RoomStateTestCase(RoomBase):
@@ -551,6 +562,51 @@ class RoomStateTestCase(RoomBase):
 
         self.assertEqual(HTTPStatus.OK, channel.code, msg=channel.result["body"])
         self.assertEqual(channel.json_body, {"membership": "join"})
+
+    def test_get_state_format_content(self) -> None:
+        """Test response of a `/rooms/$room_id/state/$event_type?format=content` request."""
+        room_id = self.helper.create_room_as(self.user_id)
+        channel1 = self.make_request(
+            "GET",
+            "/rooms/%s/state/m.room.member/%s?format=content"
+            % (
+                room_id,
+                self.user_id,
+            ),
+        )
+        self.assertEqual(channel1.code, HTTPStatus.OK, channel1.json_body)
+        self.assertEqual(channel1.json_body, {"membership": "join"})
+        channel2 = self.make_request(
+            "GET",
+            "/rooms/%s/state/m.room.member/%s"
+            % (
+                room_id,
+                self.user_id,
+            ),
+        )
+        self.assertEqual(channel2.code, HTTPStatus.OK, channel2.json_body)
+        # "content" is the default format.
+        self.assertEqual(channel1.json_body, channel2.json_body)
+
+    def test_get_state_format_event(self) -> None:
+        """Test response of a `/rooms/$room_id/state/$event_type?format=event` request."""
+        room_id = self.helper.create_room_as(self.user_id)
+        channel = self.make_request(
+            "GET",
+            "/rooms/%s/state/m.room.member/%s?format=event"
+            % (
+                room_id,
+                self.user_id,
+            ),
+        )
+        self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
+        self.assertEqual(channel.json_body["content"], {"membership": "join"})
+        self.assertEqual(channel.json_body["room_id"], room_id)
+        self.assertRegex(channel.json_body["event_id"], r"\$.+")
+        self.assertEqual(channel.json_body["type"], "m.room.member")
+        self.assertEqual(channel.json_body["sender"], self.user_id)
+        self.assertEqual(channel.json_body["state_key"], self.user_id)
+        self.assertTrue(type(channel.json_body["origin_server_ts"]) is int)
 
 
 class RoomsMemberListTestCase(RoomBase):
@@ -757,6 +813,59 @@ class RoomsCreateTestCase(RoomBase):
         assert channel.resource_usage is not None
         self.assertEqual(37, channel.resource_usage.db_txn_count)
 
+    def test_post_room_topic(self) -> None:
+        # POST with topic key, expect new room id
+        channel = self.make_request("POST", "/createRoom", b'{"topic":"shenanigans"}')
+        self.assertEqual(HTTPStatus.OK, channel.code)
+        self.assertTrue("room_id" in channel.json_body)
+        room_id = channel.json_body["room_id"]
+
+        # GET topic event, expect content from topic key
+        channel = self.make_request("GET", "/rooms/%s/state/m.room.topic" % (room_id,))
+        self.assertEqual(HTTPStatus.OK, channel.code)
+        self.assertEqual(
+            {"topic": "shenanigans", "m.topic": {"m.text": [{"body": "shenanigans"}]}},
+            channel.json_body,
+        )
+
+    def test_post_room_topic_initial_state(self) -> None:
+        # POST with m.room.topic in initial state, expect new room id
+        channel = self.make_request(
+            "POST",
+            "/createRoom",
+            b'{"initial_state":[{"type": "m.room.topic", "content": {"topic": "foobar"}}]}',
+        )
+        self.assertEqual(HTTPStatus.OK, channel.code)
+        self.assertTrue("room_id" in channel.json_body)
+        room_id = channel.json_body["room_id"]
+
+        # GET topic event, expect content from initial state
+        channel = self.make_request("GET", "/rooms/%s/state/m.room.topic" % (room_id,))
+        self.assertEqual(HTTPStatus.OK, channel.code)
+        self.assertEqual(
+            {"topic": "foobar"},
+            channel.json_body,
+        )
+
+    def test_post_room_topic_overriding_initial_state(self) -> None:
+        # POST with m.room.topic in initial state and topic key, expect new room id
+        channel = self.make_request(
+            "POST",
+            "/createRoom",
+            b'{"initial_state":[{"type": "m.room.topic", "content": {"topic": "foobar"}}], "topic":"shenanigans"}',
+        )
+        self.assertEqual(HTTPStatus.OK, channel.code)
+        self.assertTrue("room_id" in channel.json_body)
+        room_id = channel.json_body["room_id"]
+
+        # GET topic event, expect content from topic key
+        channel = self.make_request("GET", "/rooms/%s/state/m.room.topic" % (room_id,))
+        self.assertEqual(HTTPStatus.OK, channel.code)
+        self.assertEqual(
+            {"topic": "shenanigans", "m.topic": {"m.text": [{"body": "shenanigans"}]}},
+            channel.json_body,
+        )
+
     def test_post_room_visibility_key(self) -> None:
         # POST with visibility config key, expect new room id
         channel = self.make_request("POST", "/createRoom", b'{"visibility":"private"}')
@@ -860,7 +969,7 @@ class RoomsCreateTestCase(RoomBase):
         """Tests that the user_may_join_room spam checker callback is correctly bypassed
         when creating a new room.
 
-        In this test, we use the more recent API in which callbacks return a `Union[Codes, Literal["NOT_SPAM"]]`.
+        In this test, we use the more recent API in which callbacks return a `Codes | Literal["NOT_SPAM"]`.
         """
 
         async def user_may_join_room_codes(
@@ -890,7 +999,7 @@ class RoomsCreateTestCase(RoomBase):
             mxid: str,
             room_id: str,
             is_invite: bool,
-        ) -> Tuple[Codes, dict]:
+        ) -> tuple[Codes, dict]:
             return Codes.INCOMPATIBLE_ROOM_VERSION, {}
 
         join_mock.side_effect = user_may_join_room_tuple
@@ -903,7 +1012,7 @@ class RoomsCreateTestCase(RoomBase):
         self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
         self.assertEqual(join_mock.call_count, 0)
 
-    def _create_basic_room(self) -> Tuple[int, object]:
+    def _create_basic_room(self) -> tuple[int, object]:
         """
         Tries to create a basic room and returns the response code.
         """
@@ -1252,7 +1361,7 @@ class RoomJoinTestCase(RoomBase):
         """
 
         # Register a dummy callback. Make it allow all room joins for now.
-        return_value: Union[Literal["NOT_SPAM"], Tuple[Codes, dict], Codes] = (
+        return_value: Literal["NOT_SPAM"] | tuple[Codes, dict] | Codes = (
             synapse.module_api.NOT_SPAM
         )
 
@@ -1260,7 +1369,7 @@ class RoomJoinTestCase(RoomBase):
             userid: str,
             room_id: str,
             is_invited: bool,
-        ) -> Union[Literal["NOT_SPAM"], Tuple[Codes, dict], Codes]:
+        ) -> Literal["NOT_SPAM"] | tuple[Codes, dict] | Codes:
             return return_value
 
         # `spec` argument is needed for this function mock to have `__qualname__`, which
@@ -1426,7 +1535,7 @@ class RoomAppserviceTsParamTestCase(unittest.HomeserverTestCase):
             id="1234",
             namespaces={"users": [{"regex": r"@as_user.*", "exclusive": True}]},
             # Note: this user does not have to match the regex above
-            sender="@as_main:test",
+            sender=UserID.from_string("@as_main:test"),
         )
 
         mock_load_appservices = Mock(return_value=[self.appservice])
@@ -1749,20 +1858,20 @@ class RoomMessagesTestCase(RoomBase):
     def test_spam_checker_check_event_for_spam(
         self,
         name: str,
-        value: Union[str, bool, Codes, Tuple[Codes, JsonDict]],
+        value: str | bool | Codes | tuple[Codes, JsonDict],
         expected_code: int,
         expected_fields: dict,
     ) -> None:
         class SpamCheck:
-            mock_return_value: Union[str, bool, Codes, Tuple[Codes, JsonDict], bool] = (
+            mock_return_value: str | bool | Codes | tuple[Codes, JsonDict] | bool = (
                 "NOT_SPAM"
             )
-            mock_content: Optional[JsonDict] = None
+            mock_content: JsonMapping | None = None
 
             async def check_event_for_spam(
                 self,
                 event: synapse.events.EventBase,
-            ) -> Union[str, Codes, Tuple[Codes, JsonDict], bool]:
+            ) -> str | Codes | tuple[Codes, JsonDict] | bool:
                 self.mock_content = event.content
                 return self.mock_return_value
 
@@ -1816,7 +1925,7 @@ class RoomPowerLevelOverridesTestCase(RoomBase):
         self.admin_user_id = self.register_user("admin", "pass")
         self.admin_access_token = self.login("admin", "pass")
 
-    def power_levels(self, room_id: str) -> Dict[str, Any]:
+    def power_levels(self, room_id: str) -> dict[str, Any]:
         return self.helper.get_state(
             room_id, "m.room.power_levels", self.admin_access_token
         )
@@ -1824,7 +1933,8 @@ class RoomPowerLevelOverridesTestCase(RoomBase):
     def test_default_power_levels_with_room_override(self) -> None:
         """
         Create a room, providing power level overrides.
-        Confirm that the room's power levels reflect the overrides.
+        When the `power_level_content_override` was provided, it should replace the
+        default power levels.
 
         See https://github.com/matrix-org/matrix-spec/issues/492
         - currently we overwrite each key of power_level_content_override
@@ -1853,9 +1963,9 @@ class RoomPowerLevelOverridesTestCase(RoomBase):
     )
     def test_power_levels_with_server_override(self) -> None:
         """
-        With a server configured to modify the room-level defaults,
-        Create a room, without providing any extra power level overrides.
-        Confirm that the room's power levels reflect the server-level overrides.
+        With a server configured `default_power_level_content_override`, creating a room
+        without `power_level_content_override` should result in the server-level overrides
+        being applied.
 
         Similar to https://github.com/matrix-org/matrix-spec/issues/492,
         we overwrite each key of power_level_content_override completely.
@@ -1977,7 +2087,7 @@ class RoomPowerLevelOverridesInPracticeTestCase(RoomBase):
         # Given the server has config allowing normal users to post my event type
         # And I am a normal member of a room
         # But the room was created with special permissions
-        extra_content: Dict[str, Any] = {
+        extra_content: dict[str, Any] = {
             "power_level_content_override": {"events": {}},
         }
         room_id = self.helper.create_room_as(
@@ -2146,7 +2256,7 @@ class RoomMessageListTestCase(RoomBase):
         self.room_id = self.helper.create_room_as(self.user_id)
 
     def test_topo_token_is_accepted(self) -> None:
-        token = "t1-0_0_0_0_0_0_0_0_0_0"
+        token = "t1-0_0_0_0_0_0_0_0_0_0_0_0_0_0"
         channel = self.make_request(
             "GET", "/rooms/%s/messages?access_token=x&from=%s" % (self.room_id, token)
         )
@@ -2157,7 +2267,7 @@ class RoomMessageListTestCase(RoomBase):
         self.assertTrue("end" in channel.json_body)
 
     def test_stream_token_is_accepted_for_fwd_pagianation(self) -> None:
-        token = "s0_0_0_0_0_0_0_0_0_0"
+        token = "s0_0_0_0_0_0_0_0_0_0_0_0_0_0"
         channel = self.make_request(
             "GET", "/rooms/%s/messages?access_token=x&from=%s" % (self.room_id, token)
         )
@@ -2272,6 +2382,87 @@ class RoomMessageListTestCase(RoomBase):
             channel.json_body["errcode"], Codes.NOT_JSON, channel.json_body
         )
 
+    def test_room_messages_paginate_through_rejected_events(
+        self,
+    ) -> None:
+        """Test that pagination continues past a batch of rejected events.
+
+        Regression test for https://github.com/element-hq/synapse/security/advisories/GHSA-6qf2-7x63-mm6v
+
+        Synapse before 1.152.1 had a bug meaning that a batch full of only
+        rejected events would cause `/messages` to not return any more
+        pagination tokens, falsely signalling the end of backpagination.
+        """
+        # Send an early message that should not be filtered.
+        early_event_id = self.helper.send(self.room_id, "early message")["event_id"]
+
+        # Inject a batch of events and mark them as rejected in the database.
+        # We create more events than a single pagination request would fetch,
+        # so that one page of backward pagination request would only see rejected events.
+        for _ in range(3):
+            event = self.get_success(
+                inject_event(
+                    self.hs,
+                    room_id=self.room_id,
+                    sender=self.user_id,
+                    type=EventTypes.Message,
+                    content={"body": "filtered event", "msgtype": "m.text"},
+                )
+            )
+            self.get_success(
+                self.hs.get_datastores().main.db_pool.runInteraction(
+                    "mark_rejected",
+                    self.hs.get_datastores().main.mark_event_rejected_txn,
+                    event.event_id,
+                    "testing",
+                )
+            )
+
+        # Send a message after all the rejected events.
+        latest_event_id = self.helper.send(self.room_id, "latest message")["event_id"]
+
+        # Start backpaginating.
+        channel = self.make_request(
+            "GET", f"/rooms/{self.room_id}/messages?dir=b&limit=2"
+        )
+        self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
+
+        events_in_page = [e["event_id"] for e in channel.json_body["chunk"]]
+        end_token: str | None = channel.json_body["end"]
+
+        self.assertEqual(
+            events_in_page,
+            [latest_event_id],
+            "The latest event should be included in the first page we see whilst backpaginating",
+        )
+
+        event_ids_in_pages: list[list[str]] = [events_in_page]
+
+        # Bound the number of backpagination attempts to 2
+        for _ in range(2):
+            channel = self.make_request(
+                "GET", f"/rooms/{self.room_id}/messages?from={end_token}&dir=b&limit=2"
+            )
+            self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
+            events_in_page = [e["event_id"] for e in channel.json_body["chunk"]]
+            event_ids_in_pages.append(events_in_page)
+
+            if early_event_id in events_in_page:
+                # We have found the event we were looking for
+                return
+
+            self.assertIn(
+                "end",
+                channel.json_body,
+                f"No `end` token received. Did not find {early_event_id} whilst backpaginating ({latest_event_id = }, {event_ids_in_pages = })",
+            )
+            # Use the end_token in the next iteration
+            end_token = channel.json_body["end"]
+
+        self.fail(
+            f"Exhausted backpagination attempts. Did not find {early_event_id} whilst backpaginating ({latest_event_id = }, {event_ids_in_pages = })"
+        )
+
 
 class RoomMessageFilterTestCase(RoomBase):
     """Tests /rooms/$room_id/messages REST events."""
@@ -2320,7 +2511,12 @@ class RoomDelayedEventTestCase(RoomBase):
             {},
         )
         self.assertEqual(HTTPStatus.BAD_REQUEST, channel.code, channel.result)
-        self.assertNotIn("org.matrix.msc4140.errcode", channel.json_body)
+        # Assert that the standard error response uses a valid errcode.
+        # The specific errcode is irrelevant for the purpose of this test.
+        self.assertIsInstance(
+            channel.json_body.get("errcode"),
+            str,
+        )
 
     def test_delayed_event_unsupported_by_default(self) -> None:
         """Test that sending a delayed event is unsupported with the default config."""
@@ -2332,10 +2528,35 @@ class RoomDelayedEventTestCase(RoomBase):
             ).encode("ascii"),
             {"body": "test", "msgtype": "m.text"},
         )
-        self.assertEqual(HTTPStatus.BAD_REQUEST, channel.code, channel.result)
+        self.assertEqual(HTTPStatus.FORBIDDEN, channel.code, channel.result)
         self.assertEqual(
-            "M_MAX_DELAY_UNSUPPORTED",
-            channel.json_body.get("org.matrix.msc4140.errcode"),
+            Codes.FORBIDDEN,
+            channel.json_body.get("errcode"),
+            channel.json_body,
+        )
+
+    @unittest.override_config(
+        {
+            "max_event_delay_duration": "24h",
+            "experimental_features": {
+                "msc4140_max_delayed_events_per_user": 0,
+            },
+        }
+    )
+    def test_delayed_event_disabled_by_limit(self) -> None:
+        """Test that delayed events are disabled by configuring the per-user limit to 0."""
+        channel = self.make_request(
+            "PUT",
+            (
+                "rooms/%s/send/m.room.message/mid1?org.matrix.msc4140.delay=2000"
+                % self.room_id
+            ).encode("ascii"),
+            {"body": "test", "msgtype": "m.text"},
+        )
+        self.assertEqual(HTTPStatus.FORBIDDEN, channel.code, channel.result)
+        self.assertEqual(
+            Codes.FORBIDDEN,
+            channel.json_body.get("errcode"),
             channel.json_body,
         )
 
@@ -2352,10 +2573,175 @@ class RoomDelayedEventTestCase(RoomBase):
         )
         self.assertEqual(HTTPStatus.BAD_REQUEST, channel.code, channel.result)
         self.assertEqual(
-            "M_MAX_DELAY_EXCEEDED",
-            channel.json_body.get("org.matrix.msc4140.errcode"),
+            "ORG.MATRIX.MSC4140_DELAY_TOO_LARGE",
+            channel.json_body.get("errcode"),
             channel.json_body,
         )
+
+    @unittest.override_config(
+        {
+            "max_event_delay_duration": "24h",
+            "experimental_features": {
+                "msc4140_max_delayed_events_per_user": 1,
+            },
+        }
+    )
+    def test_delayed_event_user_limit_reached(self) -> None:
+        """Test that users cannot have more delayed events scheduled at once than allowed."""
+        # Disable rate-limits for this user. We want to specifically test the storage-based limit, not the request limits
+        self.get_success(
+            self.hs.get_datastores().main.set_ratelimit_for_user(self.user_id, 0, 0)
+        )
+
+        make_delayed_event_request = lambda: self.make_request(
+            "POST",
+            (
+                "rooms/%s/send/m.room.message?org.matrix.msc4140.delay=15000"
+                % self.room_id
+            ).encode("ascii"),
+            {"body": "test", "msgtype": "m.text"},
+        )
+        # Send a delayed event to eat up the limit
+        channel = make_delayed_event_request()
+        self.assertEqual(HTTPStatus.OK, channel.code, channel.result)
+
+        # Try to send another delayed event (we expect to hit the limit on the max number of delayed events that can be scheduled at once)
+        channel = make_delayed_event_request()
+        self.assertEqual(HTTPStatus.TOO_MANY_REQUESTS, channel.code, channel.result)
+        self.assertEqual(
+            Codes.LIMIT_EXCEEDED,
+            channel.json_body["errcode"],
+            channel.json_body,
+        )
+        # Confirm that the response includes the time remaining until the next of the user's
+        # delayed events to be sent, at which point another delayed event may be scheduled
+        # without exceeding the limit
+        retry_after_headers = channel.headers.getRawHeaders("Retry-After")
+        assert retry_after_headers
+        retry_after_sec = int(retry_after_headers[0])
+        self.assertGreater(retry_after_sec, 0)
+        # Confirm that there is only a single value to the Retry-After header, as per RFC9110
+        self.assertEqual(1, len(retry_after_headers))
+
+        # Wait until we're able to retry again (the retry time from the error response)
+        self.reactor.advance(retry_after_sec)
+
+        # We should be able to send another delayed event again
+        channel = make_delayed_event_request()
+        self.assertEqual(HTTPStatus.OK, channel.code, channel.result)
+
+    @unittest.override_config(
+        {
+            "max_event_delay_duration": "24h",
+            "experimental_features": {
+                "msc4140_max_delayed_events_per_user": 1,
+            },
+        }
+    )
+    def test_delayed_event_processed_user_limit_reached(self) -> None:
+        """
+        Test that delayed events in the midst of being sent still count towards the limit of
+        how many delayed events a user may have scheduled at once.
+        """
+        send_after = Duration(seconds=1)
+        make_delayed_event_request = lambda: self.make_request(
+            "POST",
+            (
+                f"rooms/%s/send/m.room.message?org.matrix.msc4140.delay={send_after.as_millis()}"
+                % self.room_id
+            ).encode("ascii"),
+            {"body": "test", "msgtype": "m.text"},
+        )
+        channel = make_delayed_event_request()
+        self.assertEqual(HTTPStatus.OK, channel.code, channel.result)
+
+        # Simulate the server taking a long time to persist delayed events
+        simulated_send_lag = Duration(seconds=5)
+        event_creation_handler = self.hs.get_event_creation_handler()
+        orig_send_fn = event_creation_handler.create_and_send_nonmember_event
+
+        async def slow_send_fn(*args: Any, **kwargs: Any) -> Any:
+            await self.clock.sleep(simulated_send_lag)
+            return await orig_send_fn(*args, **kwargs)
+
+        with patch.object(event_creation_handler, orig_send_fn.__name__, slow_send_fn):
+            self.reactor.advance(send_after.as_secs())
+            channel = make_delayed_event_request()
+            self.assertEqual(HTTPStatus.TOO_MANY_REQUESTS, channel.code, channel.result)
+            self.assertEqual(
+                Codes.LIMIT_EXCEEDED,
+                channel.json_body["errcode"],
+                channel.json_body,
+            )
+            # Confirm that the response lacks a Retry-After header, because the reason for this limit
+            # is the server taking an indeterminitely long time to process a delayed event, and the
+            # server doesn't know how much longer the client should wait before sending more requests
+            retry_after_headers = channel.headers.getRawHeaders("Retry-After")
+            assert not retry_after_headers
+
+            # Wait until the delayed event gets persisted
+            self.reactor.advance(simulated_send_lag.as_secs())
+
+            # We should be able to send another delayed event again
+            channel = make_delayed_event_request()
+            self.assertEqual(HTTPStatus.OK, channel.code, channel.result)
+
+    @unittest.override_config(
+        {
+            "max_event_delay_duration": "24h",
+            "experimental_features": {
+                "msc4140_max_delayed_events_per_user": 5,
+            },
+        }
+    )
+    def test_delayed_event_user_limit_exceeded(self) -> None:
+        """
+        Test that delayed event limits work properly when
+        the number of already scheduled events exceeds the configured limit.
+
+        This can be invoked by the server admin lowering the configured limit & restarting the server
+        while a user has fewer scheduled delayed events than the old limit, but more than the new limit.
+        """
+        send_after: Duration
+        make_delayed_event_request = lambda: self.make_request(
+            "POST",
+            (
+                f"rooms/%s/send/m.room.message?org.matrix.msc4140.delay={send_after.as_millis()}"
+                % self.room_id
+            ).encode("ascii"),
+            {"body": f"test (send after {send_after.as_secs()}s)", "msgtype": "m.text"},
+        )
+
+        for i in range(4):
+            send_after = Duration(seconds=i)
+            channel = make_delayed_event_request()
+            self.assertEqual(HTTPStatus.OK, channel.code, channel.result)
+
+        # Simulate restarting the server after having reconfigured the limit
+        # to be lower than the number of delayed events we just scheduled.
+        #
+        # Set the limit > 1 to test not having to wait for _all_ delayed events
+        # to be sent before being able to schedule a new one.
+        self.hs.config.server.max_delayed_events_per_user = 2
+
+        channel = make_delayed_event_request()
+        self.assertEqual(HTTPStatus.TOO_MANY_REQUESTS, channel.code, channel.result)
+        self.assertEqual(
+            Codes.LIMIT_EXCEEDED,
+            channel.json_body["errcode"],
+            channel.json_body,
+        )
+        retry_after_header = channel.headers.getRawHeaders("Retry-After")
+        assert retry_after_header
+        retry_after_sec = int(retry_after_header[0])
+        assert retry_after_sec > 0
+
+        # Wait until we're able to retry again (the retry time from the error response)
+        self.reactor.advance(retry_after_sec)
+
+        # We should be able to send another delayed event again
+        channel = make_delayed_event_request()
+        self.assertEqual(HTTPStatus.OK, channel.code, channel.result)
 
     @unittest.override_config({"max_event_delay_duration": "24h"})
     def test_delayed_event_with_negative_delay(self) -> None:
@@ -2412,7 +2798,7 @@ class RoomDelayedEventTestCase(RoomBase):
         """
 
         # Test that new delayed events are correctly ratelimited.
-        args = (
+        make_delayed_event_request = lambda: self.make_request(
             "POST",
             (
                 "rooms/%s/send/m.room.message?org.matrix.msc4140.delay=2000"
@@ -2420,9 +2806,9 @@ class RoomDelayedEventTestCase(RoomBase):
             ).encode("ascii"),
             {"body": "test", "msgtype": "m.text"},
         )
-        channel = self.make_request(*args)
+        channel = make_delayed_event_request()
         self.assertEqual(HTTPStatus.OK, channel.code, channel.result)
-        channel = self.make_request(*args)
+        channel = make_delayed_event_request()
         self.assertEqual(HTTPStatus.TOO_MANY_REQUESTS, channel.code, channel.result)
 
         # Add the current user to the ratelimit overrides, allowing them no ratelimiting.
@@ -2431,7 +2817,7 @@ class RoomDelayedEventTestCase(RoomBase):
         )
 
         # Test that the new delayed events aren't ratelimited anymore.
-        channel = self.make_request(*args)
+        channel = make_delayed_event_request()
         self.assertEqual(HTTPStatus.OK, channel.code, channel.result)
 
 
@@ -2602,15 +2988,15 @@ class PublicRoomsRoomTypeFilterTestCase(unittest.HomeserverTestCase):
         )
 
     def default_config(self) -> JsonDict:
-        config = default_config("test")
+        config = default_config(server_name="test")
         config["room_list_publication_rules"] = [{"action": "allow"}]
         return config
 
     def make_public_rooms_request(
         self,
-        room_types: Optional[List[Union[str, None]]],
-        instance_id: Optional[str] = None,
-    ) -> Tuple[List[Dict[str, Any]], int]:
+        room_types: list[str | None] | None,
+        instance_id: str | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
         body: JsonDict = {"filter": {PublicRoomsFilterFields.ROOM_TYPES: room_types}}
         if instance_id:
             body["third_party_instance_id"] = "test|test"
@@ -3371,7 +3757,7 @@ class LabelsTestCase(unittest.HomeserverTestCase):
 
 
 class RelationsTestCase(PaginationTestCase):
-    def _filter_messages(self, filter: JsonDict) -> List[str]:
+    def _filter_messages(self, filter: JsonDict) -> list[str]:
         """Make a request to /messages with a filter, returns the chunk of events."""
         from_token = self.get_success(
             self.from_token.to_string(self.hs.get_datastores().main)
@@ -3781,9 +4167,11 @@ class RoomCanonicalAliasTestCase(unittest.HomeserverTestCase):
         self._set_canonical_alias({"alt_aliases": False}, expected_code=400)
         self._set_canonical_alias({"alt_aliases": True}, expected_code=400)
         self._set_canonical_alias({"alt_aliases": {}}, expected_code=400)
+        self._set_canonical_alias({"alt_aliases": [0]}, expected_code=400)
 
     def test_bad_alias(self) -> None:
         """An alias which does not point to the room raises a SynapseError."""
+        self._set_canonical_alias({"alias": {"@unknown:test": "a"}}, expected_code=400)
         self._set_canonical_alias({"alias": "@unknown:test"}, expected_code=400)
         self._set_canonical_alias({"alt_aliases": ["@unknown:test"]}, expected_code=400)
 
@@ -3869,7 +4257,7 @@ class ThreepidInviteTestCase(unittest.HomeserverTestCase):
         """
         Test allowing/blocking threepid invites with a spam-check module.
 
-        In this test, we use the more recent API in which callbacks return a `Union[Codes, Literal["NOT_SPAM"]]`.
+        In this test, we use the more recent API in which callbacks return a `Codes | Literal["NOT_SPAM"]`.
         """
         # Mock a few functions to prevent the test from failing due to failing to talk to
         # a remote IS. We keep the mock for make_and_store_3pid_invite around so we
@@ -4401,3 +4789,1099 @@ class RoomParticipantTestCase(unittest.HomeserverTestCase):
             self.store.get_room_participation(self.user2, self.room1)
         )
         self.assertFalse(participant)
+
+
+class MSC4293RedactOnBanKickTestCase(unittest.FederatingHomeserverTestCase):
+    servlets = [
+        synapse.rest.admin.register_servlets_for_client_rest_resource,
+        room.register_servlets,
+        login.register_servlets,
+        admin.register_servlets,
+    ]
+
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        super().prepare(reactor, clock, hs)
+        self.creator = self.register_user("creator", "test")
+        self.creator_tok = self.login("creator", "test")
+
+        self.bad_user_id = self.register_user("bad", "test")
+        self.bad_tok = self.login("bad", "test")
+
+        self.room_id = self.helper.create_room_as(self.creator, tok=self.creator_tok)
+
+        self.store = hs.get_datastores().main
+        self._storage_controllers = hs.get_storage_controllers()
+
+        self.federation_event_handler = self.hs.get_federation_event_handler()
+
+        self.hs.config.experimental.msc4293_enabled = True
+
+    def _check_redactions(
+        self,
+        original_events: list[EventBase],
+        pulled_events: list[JsonDict],
+        expect_redaction: bool,
+        reason: str | None = None,
+    ) -> None:
+        """
+        Checks a set of original events against a second set of the same events, pulled
+        from the /messages api. If expect_redaction is true, we expect that the second
+        set of events will be redacted, and the test will fail if that is not the case.
+        Otherwise, verifies that the events have not been redacted and fails if not.
+
+        Args:
+            original_events: A list of the original events sent
+            pulled_events: A list of the same events as the orignal events, fetched
+            over the /messages api
+            expect_redaction: Whether or not the pulled_events should be redacted
+            reason: If the events are expected to be redacted, the expected reason
+            for the redaction
+
+        """
+        if expect_redaction:
+            redacted_count = 0
+            for pulled_event in pulled_events:
+                for old_event in original_events:
+                    if pulled_event["event_id"] != old_event.event_id:
+                        continue
+                    # we have a matching event, check that it is redacted
+                    event_content = pulled_event["content"]
+                    if event_content:
+                        self.fail(f"Expected event {pulled_event} to be redacted")
+                    redacting_event = pulled_event.get("redacted_because")
+                    if not redacting_event:
+                        self.fail(
+                            f"Expected event {pulled_event} to have a redacting event."
+                        )
+                    # check that the redacting event records the expected reason, and the
+                    # redact_events flag
+                    content = redacting_event["content"]
+                    self.assertEqual(content["reason"], reason)
+                    self.assertEqual(content["org.matrix.msc4293.redact_events"], True)
+                    redacted_count += 1
+            # all provided events should be redacted
+            self.assertEqual(len(original_events), redacted_count)
+        else:
+            unredacted_events = 0
+            for pulled_event in pulled_events:
+                for old_event in original_events:
+                    if pulled_event["event_id"] != old_event.event_id:
+                        continue
+                    # we have a matching event, make sure it is not redacted
+                    redacted_because = pulled_event.get("redacted_because")
+                    if redacted_because:
+                        self.fail("Event should not have been redacted")
+                    self.assertEqual(old_event.content, pulled_event["content"])
+                    unredacted_events += 1
+            # all provided events should not have been redacted
+            self.assertEqual(unredacted_events, len(original_events))
+
+    def test_banning_local_member_with_flag_redacts_their_events(self) -> None:
+        self.helper.join(self.room_id, self.bad_user_id, tok=self.bad_tok)
+
+        # bad user sends some messages
+        originals = []
+        for i in range(5):
+            event = {"body": f"bothersome noise {i}", "msgtype": "m.text"}
+            res = self.helper.send_event(
+                self.room_id, "m.room.message", event, tok=self.bad_tok, expect_code=200
+            )
+            originals.append(res["event_id"])
+
+        # grab original events for comparison
+        original_events = [self.get_success(self.store.get_event(x)) for x in originals]
+
+        # creator bans user with redaction flag set
+        content = {
+            "reason": "flooding",
+            "org.matrix.msc4293.redact_events": True,
+        }
+        self.helper.change_membership(
+            self.room_id,
+            self.creator,
+            self.bad_user_id,
+            "ban",
+            content,
+            self.creator_tok,
+        )
+
+        filter = json.dumps({"types": [EventTypes.Message]})
+        channel = self.make_request(
+            "GET",
+            f"rooms/{self.room_id}/messages?filter={filter}&limit=50",
+            access_token=self.creator_tok,
+        )
+        self.assertEqual(channel.code, 200)
+        self._check_redactions(
+            original_events,
+            channel.json_body["chunk"],
+            expect_redaction=True,
+            reason="flooding",
+        )
+
+    def test_banning_remote_member_with_flag_redacts_their_events(self) -> None:
+        bad_user = "@remote_bad_user:" + self.OTHER_SERVER_NAME
+        channel = self.make_signed_federation_request(
+            "GET",
+            f"/_matrix/federation/v1/make_join/{self.room_id}/{bad_user}?ver=11",
+        )
+        self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
+        join_result = channel.json_body
+
+        join_event_dict = join_result["event"]
+        self.add_hashes_and_signatures_from_other_server(
+            join_event_dict,
+            RoomVersions.V11,
+        )
+        channel = self.make_signed_federation_request(
+            "PUT",
+            f"/_matrix/federation/v2/send_join/{self.room_id}/x",
+            content=join_event_dict,
+        )
+        self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
+
+        # the room should show that the bad user is a member
+        r = self.get_success(
+            self._storage_controllers.state.get_current_state(self.room_id)
+        )
+        self.assertEqual(r[("m.room.member", bad_user)].membership, "join")
+
+        auth_ids = [
+            r[("m.room.create", "")].event_id,
+            r[("m.room.power_levels", "")].event_id,
+            r[("m.room.member", "@remote_bad_user:other.example.com")].event_id,
+        ]
+        original_messages = []
+        for i in range(5):
+            remote_message = make_event_from_dict(
+                self.add_hashes_and_signatures_from_other_server(
+                    {
+                        "room_id": self.room_id,
+                        "sender": bad_user,
+                        "depth": 1000,
+                        "origin_server_ts": 1,
+                        "type": "m.room.message",
+                        "content": {"body": f"remote bummer{i}"},
+                        "auth_events": auth_ids,
+                        "prev_events": auth_ids,
+                    }
+                ),
+                room_version=RoomVersions.V11,
+            )
+
+            self.get_success(
+                self.federation_event_handler.on_receive_pdu(
+                    self.OTHER_SERVER_NAME, remote_message
+                )
+            )
+            original_messages.append(remote_message)
+
+        # creator bans bad user with redaction flag set
+        content = {
+            "reason": "bummer messages",
+            "org.matrix.msc4293.redact_events": True,
+        }
+        res = self.helper.change_membership(
+            self.room_id, self.creator, bad_user, "ban", content, self.creator_tok
+        )
+        ban_event_id = res["event_id"]
+
+        filter = json.dumps({"types": [EventTypes.Message]})
+        channel = self.make_request(
+            "GET",
+            f"rooms/{self.room_id}/messages?filter={filter}&limit=50",
+            access_token=self.creator_tok,
+        )
+        self.assertEqual(channel.code, 200)
+        self._check_redactions(
+            original_messages,
+            channel.json_body["chunk"],
+            expect_redaction=True,
+            reason="bummer messages",
+        )
+
+        # any future messages that are soft-failed are also redacted - send messages referencing
+        # dag before ban, they should be soft-failed but also redacted
+        new_original_messages = []
+        for i in range(5):
+            remote_message = make_event_from_dict(
+                self.add_hashes_and_signatures_from_other_server(
+                    {
+                        "room_id": self.room_id,
+                        "sender": bad_user,
+                        "depth": 1000,
+                        "origin_server_ts": 1,
+                        "type": "m.room.message",
+                        "content": {"body": f"soft-fail remote bummer{i}"},
+                        "auth_events": auth_ids,
+                        "prev_events": auth_ids,
+                    }
+                ),
+                room_version=RoomVersions.V11,
+            )
+
+            self.get_success(
+                self.federation_event_handler.on_receive_pdu(
+                    self.OTHER_SERVER_NAME, remote_message
+                )
+            )
+            new_original_messages.append(remote_message)
+
+        # pull them from the db to check because they should be soft-failed and thus not available over
+        # cs-api
+        for message in new_original_messages:
+            original = self.get_success(self.store.get_event(message.event_id))
+            if not original:
+                self.fail("Expected to find remote message in DB")
+            redacted_by = original.internal_metadata.redacted_by
+            if not redacted_by:
+                self.fail("Did not find redacted_by field")
+            self.assertEqual(redacted_by, ban_event_id)
+
+    def test_unbanning_remote_user_stops_redaction_action(self) -> None:
+        bad_user = "@remote_bad_user:" + self.OTHER_SERVER_NAME
+        channel = self.make_signed_federation_request(
+            "GET",
+            f"/_matrix/federation/v1/make_join/{self.room_id}/{bad_user}?ver=11",
+        )
+        self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
+        join_result = channel.json_body
+
+        join_event_dict = join_result["event"]
+        self.add_hashes_and_signatures_from_other_server(
+            join_event_dict,
+            RoomVersions.V11,
+        )
+        channel = self.make_signed_federation_request(
+            "PUT",
+            f"/_matrix/federation/v2/send_join/{self.room_id}/x",
+            content=join_event_dict,
+        )
+        self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
+
+        # the room should show that the bad user is a member
+        r = self.get_success(
+            self._storage_controllers.state.get_current_state(self.room_id)
+        )
+        self.assertEqual(r[("m.room.member", bad_user)].membership, "join")
+
+        auth_ids = [
+            r[("m.room.create", "")].event_id,
+            r[("m.room.power_levels", "")].event_id,
+            r[("m.room.member", "@remote_bad_user:other.example.com")].event_id,
+        ]
+        original_messages = []
+        for i in range(5):
+            remote_message = make_event_from_dict(
+                self.add_hashes_and_signatures_from_other_server(
+                    {
+                        "room_id": self.room_id,
+                        "sender": bad_user,
+                        "depth": 1000,
+                        "origin_server_ts": 1,
+                        "type": "m.room.message",
+                        "content": {"body": f"annoying messages {i}"},
+                        "auth_events": auth_ids,
+                        "prev_events": auth_ids,
+                    }
+                ),
+                room_version=RoomVersions.V11,
+            )
+
+            self.get_success(
+                self.federation_event_handler.on_receive_pdu(
+                    self.OTHER_SERVER_NAME, remote_message
+                )
+            )
+            original_messages.append(remote_message)
+
+        # creator bans bad user with redaction flag set
+        content = {
+            "reason": "this dude sucks",
+            "org.matrix.msc4293.redact_events": True,
+        }
+        self.helper.change_membership(
+            self.room_id, self.creator, bad_user, "ban", content, self.creator_tok
+        )
+
+        filter = json.dumps({"types": [EventTypes.Message]})
+        channel = self.make_request(
+            "GET",
+            f"rooms/{self.room_id}/messages?filter={filter}&limit=50",
+            access_token=self.creator_tok,
+        )
+        self.assertEqual(channel.code, 200)
+        self._check_redactions(
+            original_messages,
+            channel.json_body["chunk"],
+            True,
+            reason="this dude sucks",
+        )
+
+        # unban user
+        self.helper.change_membership(
+            self.room_id, self.creator, bad_user, "unban", {}, self.creator_tok
+        )
+
+        # user should be able to join again
+        channel = self.make_signed_federation_request(
+            "GET",
+            f"/_matrix/federation/v1/make_join/{self.room_id}/{bad_user}?ver=11",
+        )
+        self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
+        join_result = channel.json_body
+
+        join_event_dict = join_result["event"]
+        self.add_hashes_and_signatures_from_other_server(
+            join_event_dict,
+            RoomVersions.V10,
+        )
+        channel = self.make_signed_federation_request(
+            "PUT",
+            f"/_matrix/federation/v2/send_join/{self.room_id}/x",
+            content=join_event_dict,
+        )
+        self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
+
+        # the room should show that the bad user is a member again
+        new_state = self.get_success(
+            self._storage_controllers.state.get_current_state(self.room_id)
+        )
+        self.assertEqual(new_state[("m.room.member", bad_user)].membership, "join")
+
+        new_state = self.get_success(
+            self._storage_controllers.state.get_current_state(self.room_id)
+        )
+        auth_ids = [
+            new_state[("m.room.create", "")].event_id,
+            new_state[("m.room.power_levels", "")].event_id,
+            new_state[("m.room.member", "@remote_bad_user:other.example.com")].event_id,
+        ]
+
+        # messages after unban and join proceed unredacted
+        new_original_messages = []
+        for i in range(5):
+            remote_message = make_event_from_dict(
+                self.add_hashes_and_signatures_from_other_server(
+                    {
+                        "room_id": self.room_id,
+                        "sender": bad_user,
+                        "depth": 1000,
+                        "origin_server_ts": 1,
+                        "type": "m.room.message",
+                        "content": {"body": f"no longer a bummer {i}"},
+                        "auth_events": auth_ids,
+                        "prev_events": auth_ids,
+                    }
+                ),
+                room_version=RoomVersions.V11,
+            )
+
+            self.get_success(
+                self.federation_event_handler.on_receive_pdu(
+                    self.OTHER_SERVER_NAME, remote_message
+                )
+            )
+            new_original_messages.append(remote_message)
+
+        filter = json.dumps({"types": [EventTypes.Message]})
+        channel = self.make_request(
+            "GET",
+            f"rooms/{self.room_id}/messages?filter={filter}&limit=50",
+            access_token=self.creator_tok,
+        )
+        self.assertEqual(channel.code, 200)
+        self._check_redactions(new_original_messages, channel.json_body["chunk"], False)
+
+    def test_redaction_flag_ignored_for_user_if_banner_lacks_redaction_power(
+        self,
+    ) -> None:
+        # change power levels so creator can ban but not redact
+        self.helper.send_state(
+            self.room_id,
+            "m.room.power_levels",
+            {"events_default": 0, "redact": 100, "users": {self.creator: 75}},
+            tok=self.creator_tok,
+        )
+        self.helper.join(self.room_id, self.bad_user_id, tok=self.bad_tok)
+
+        # bad user sends some messages
+        original_ids = []
+        for i in range(15):
+            event = {"body": f"being a menace {i}", "msgtype": "m.text"}
+            res = self.helper.send_event(
+                self.room_id, "m.room.message", event, tok=self.bad_tok, expect_code=200
+            )
+            original_ids.append(res["event_id"])
+
+        # grab original events before ban
+        originals = [self.get_success(self.store.get_event(x)) for x in original_ids]
+
+        # creator bans bad user with redaction flag
+        content = {
+            "reason": "flooding",
+            "org.matrix.msc4293.redact_events": True,
+        }
+        self.helper.change_membership(
+            self.room_id,
+            self.creator,
+            self.bad_user_id,
+            "ban",
+            content,
+            self.creator_tok,
+        )
+
+        filter = json.dumps({"types": [EventTypes.Message]})
+        channel = self.make_request(
+            "GET",
+            f"rooms/{self.room_id}/messages?filter={filter}&limit=50",
+            access_token=self.creator_tok,
+        )
+        self.assertEqual(channel.code, 200)
+        # messages are not redacted
+        self._check_redactions(originals, channel.json_body["chunk"], False)
+
+    def test_kicking_local_member_with_flag_redacts_their_events(self) -> None:
+        self.helper.join(self.room_id, self.bad_user_id, tok=self.bad_tok)
+
+        # bad user sends some messages
+        originals = []
+        for i in range(5):
+            event = {"body": f"bothersome noise {i}", "msgtype": "m.text"}
+            res = self.helper.send_event(
+                self.room_id, "m.room.message", event, tok=self.bad_tok, expect_code=200
+            )
+            originals.append(res["event_id"])
+
+        # grab original events for comparison
+        original_events = [self.get_success(self.store.get_event(x)) for x in originals]
+
+        # creator kicks user with redaction flag set
+        content = {
+            "reason": "flooding",
+            "org.matrix.msc4293.redact_events": True,
+        }
+        self.helper.change_membership(
+            self.room_id,
+            self.creator,
+            self.bad_user_id,
+            "kick",
+            content,
+            self.creator_tok,
+        )
+
+        filter = json.dumps({"types": [EventTypes.Message]})
+        channel = self.make_request(
+            "GET",
+            f"rooms/{self.room_id}/messages?filter={filter}&limit=50",
+            access_token=self.creator_tok,
+        )
+        self.assertEqual(channel.code, 200)
+        self._check_redactions(
+            original_events,
+            channel.json_body["chunk"],
+            expect_redaction=True,
+            reason="flooding",
+        )
+
+    def test_kicking_remote_member_with_flag_redacts_their_events(self) -> None:
+        bad_user = "@remote_bad_user:" + self.OTHER_SERVER_NAME
+        channel = self.make_signed_federation_request(
+            "GET",
+            f"/_matrix/federation/v1/make_join/{self.room_id}/{bad_user}?ver=11",
+        )
+        self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
+        join_result = channel.json_body
+
+        join_event_dict = join_result["event"]
+        self.add_hashes_and_signatures_from_other_server(
+            join_event_dict,
+            RoomVersions.V11,
+        )
+        channel = self.make_signed_federation_request(
+            "PUT",
+            f"/_matrix/federation/v2/send_join/{self.room_id}/x",
+            content=join_event_dict,
+        )
+        self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
+
+        # the room should show that the bad user is a member
+        r = self.get_success(
+            self._storage_controllers.state.get_current_state(self.room_id)
+        )
+        self.assertEqual(r[("m.room.member", bad_user)].membership, "join")
+
+        auth_ids = [
+            r[("m.room.create", "")].event_id,
+            r[("m.room.power_levels", "")].event_id,
+            r[("m.room.member", "@remote_bad_user:other.example.com")].event_id,
+        ]
+        original_messages = []
+        for i in range(5):
+            remote_message = make_event_from_dict(
+                self.add_hashes_and_signatures_from_other_server(
+                    {
+                        "room_id": self.room_id,
+                        "sender": bad_user,
+                        "depth": 1000,
+                        "origin_server_ts": 1,
+                        "type": "m.room.message",
+                        "content": {"body": f"remote bummer{i}"},
+                        "auth_events": auth_ids,
+                        "prev_events": auth_ids,
+                    }
+                ),
+                room_version=RoomVersions.V11,
+            )
+
+            self.get_success(
+                self.federation_event_handler.on_receive_pdu(
+                    self.OTHER_SERVER_NAME, remote_message
+                )
+            )
+            original_messages.append(remote_message)
+
+        # creator kicks bad user with redaction flag set
+        content = {
+            "reason": "bummer messages",
+            "org.matrix.msc4293.redact_events": True,
+        }
+        res = self.helper.change_membership(
+            self.room_id, self.creator, bad_user, "kick", content, self.creator_tok
+        )
+        ban_event_id = res["event_id"]
+
+        filter = json.dumps({"types": [EventTypes.Message]})
+        channel = self.make_request(
+            "GET",
+            f"rooms/{self.room_id}/messages?filter={filter}&limit=50",
+            access_token=self.creator_tok,
+        )
+        self.assertEqual(channel.code, 200)
+        self._check_redactions(
+            original_messages,
+            channel.json_body["chunk"],
+            expect_redaction=True,
+            reason="bummer messages",
+        )
+
+        # any future messages that are soft-failed are also redacted - send messages referencing
+        # dag before ban, they should be soft-failed but also redacted
+        new_original_messages = []
+        for i in range(5):
+            remote_message = make_event_from_dict(
+                self.add_hashes_and_signatures_from_other_server(
+                    {
+                        "room_id": self.room_id,
+                        "sender": bad_user,
+                        "depth": 1000,
+                        "origin_server_ts": 1,
+                        "type": "m.room.message",
+                        "content": {"body": f"soft-fail remote bummer{i}"},
+                        "auth_events": auth_ids,
+                        "prev_events": auth_ids,
+                    }
+                ),
+                room_version=RoomVersions.V11,
+            )
+
+            self.get_success(
+                self.federation_event_handler.on_receive_pdu(
+                    self.OTHER_SERVER_NAME, remote_message
+                )
+            )
+            new_original_messages.append(remote_message)
+
+        # pull them from the db to check because they should be soft-failed and thus not available over
+        # cs-api
+        for message in new_original_messages:
+            original = self.get_success(self.store.get_event(message.event_id))
+            if not original:
+                self.fail("Expected to find remote message in DB")
+            self.assertEqual(original.internal_metadata.redacted_by, ban_event_id)
+
+    def test_rejoining_kicked_remote_user_stops_redaction_action(self) -> None:
+        bad_user = "@remote_bad_user:" + self.OTHER_SERVER_NAME
+        channel = self.make_signed_federation_request(
+            "GET",
+            f"/_matrix/federation/v1/make_join/{self.room_id}/{bad_user}?ver=11",
+        )
+        self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
+        join_result = channel.json_body
+
+        join_event_dict = join_result["event"]
+        self.add_hashes_and_signatures_from_other_server(
+            join_event_dict,
+            RoomVersions.V11,
+        )
+        channel = self.make_signed_federation_request(
+            "PUT",
+            f"/_matrix/federation/v2/send_join/{self.room_id}/x",
+            content=join_event_dict,
+        )
+        self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
+
+        # the room should show that the bad user is a member
+        r = self.get_success(
+            self._storage_controllers.state.get_current_state(self.room_id)
+        )
+        self.assertEqual(r[("m.room.member", bad_user)].membership, "join")
+
+        auth_ids = [
+            r[("m.room.create", "")].event_id,
+            r[("m.room.power_levels", "")].event_id,
+            r[("m.room.member", "@remote_bad_user:other.example.com")].event_id,
+        ]
+        original_messages = []
+        for i in range(5):
+            remote_message = make_event_from_dict(
+                self.add_hashes_and_signatures_from_other_server(
+                    {
+                        "room_id": self.room_id,
+                        "sender": bad_user,
+                        "depth": 1000,
+                        "origin_server_ts": 1,
+                        "type": "m.room.message",
+                        "content": {"body": f"annoying messages {i}"},
+                        "auth_events": auth_ids,
+                        "prev_events": auth_ids,
+                    }
+                ),
+                room_version=RoomVersions.V11,
+            )
+
+            self.get_success(
+                self.federation_event_handler.on_receive_pdu(
+                    self.OTHER_SERVER_NAME, remote_message
+                )
+            )
+            original_messages.append(remote_message)
+
+        # creator kicks bad user with redaction flag set
+        content = {
+            "reason": "this dude sucks",
+            "org.matrix.msc4293.redact_events": True,
+        }
+        self.helper.change_membership(
+            self.room_id, self.creator, bad_user, "kick", content, self.creator_tok
+        )
+
+        filter = json.dumps({"types": [EventTypes.Message]})
+        channel = self.make_request(
+            "GET",
+            f"rooms/{self.room_id}/messages?filter={filter}&limit=50",
+            access_token=self.creator_tok,
+        )
+        self.assertEqual(channel.code, 200)
+        self._check_redactions(
+            original_messages,
+            channel.json_body["chunk"],
+            True,
+            reason="this dude sucks",
+        )
+
+        # user re-joins after kick
+        channel = self.make_signed_federation_request(
+            "GET",
+            f"/_matrix/federation/v1/make_join/{self.room_id}/{bad_user}?ver=11",
+        )
+        self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
+        join_result = channel.json_body
+
+        join_event_dict = join_result["event"]
+        self.add_hashes_and_signatures_from_other_server(
+            join_event_dict,
+            RoomVersions.V11,
+        )
+        channel = self.make_signed_federation_request(
+            "PUT",
+            f"/_matrix/federation/v2/send_join/{self.room_id}/x",
+            content=join_event_dict,
+        )
+        self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
+
+        # the room should show that the bad user is a member again
+        new_state = self.get_success(
+            self._storage_controllers.state.get_current_state(self.room_id)
+        )
+        self.assertEqual(new_state[("m.room.member", bad_user)].membership, "join")
+
+        new_state = self.get_success(
+            self._storage_controllers.state.get_current_state(self.room_id)
+        )
+        auth_ids = [
+            new_state[("m.room.create", "")].event_id,
+            new_state[("m.room.power_levels", "")].event_id,
+            new_state[("m.room.member", "@remote_bad_user:other.example.com")].event_id,
+        ]
+
+        # messages after kick and re-join proceed unredacted
+        new_original_messages = []
+        for i in range(5):
+            remote_message = make_event_from_dict(
+                self.add_hashes_and_signatures_from_other_server(
+                    {
+                        "room_id": self.room_id,
+                        "sender": bad_user,
+                        "depth": 1000,
+                        "origin_server_ts": 1,
+                        "type": "m.room.message",
+                        "content": {"body": f"no longer a bummer {i}"},
+                        "auth_events": auth_ids,
+                        "prev_events": auth_ids,
+                    }
+                ),
+                room_version=RoomVersions.V11,
+            )
+
+            self.get_success(
+                self.federation_event_handler.on_receive_pdu(
+                    self.OTHER_SERVER_NAME, remote_message
+                )
+            )
+            new_original_messages.append(remote_message)
+
+        filter = json.dumps({"types": [EventTypes.Message]})
+        channel = self.make_request(
+            "GET",
+            f"rooms/{self.room_id}/messages?filter={filter}&limit=50",
+            access_token=self.creator_tok,
+        )
+        self.assertEqual(channel.code, 200)
+        self._check_redactions(new_original_messages, channel.json_body["chunk"], False)
+
+    def test_redaction_flag_ignored_for_user_if_kicker_lacks_redaction_power(
+        self,
+    ) -> None:
+        # change power levels so creator can kick but not redact
+        self.helper.send_state(
+            self.room_id,
+            "m.room.power_levels",
+            {"events_default": 0, "redact": 100, "users": {self.creator: 75}},
+            tok=self.creator_tok,
+        )
+        self.helper.join(self.room_id, self.bad_user_id, tok=self.bad_tok)
+
+        # bad user sends some messages
+        original_ids = []
+        for i in range(15):
+            event = {"body": f"being a menace {i}", "msgtype": "m.text"}
+            res = self.helper.send_event(
+                self.room_id, "m.room.message", event, tok=self.bad_tok, expect_code=200
+            )
+            original_ids.append(res["event_id"])
+
+        # grab original events before ban
+        originals = [self.get_success(self.store.get_event(x)) for x in original_ids]
+
+        # creator kicks bad user with redaction flag
+        content = {
+            "reason": "flooding",
+            "org.matrix.msc4293.redact_events": True,
+        }
+        self.helper.change_membership(
+            self.room_id,
+            self.creator,
+            self.bad_user_id,
+            "kick",
+            content,
+            self.creator_tok,
+        )
+
+        filter = json.dumps({"types": [EventTypes.Message]})
+        channel = self.make_request(
+            "GET",
+            f"rooms/{self.room_id}/messages?filter={filter}&limit=50",
+            access_token=self.creator_tok,
+        )
+        self.assertEqual(channel.code, 200)
+        # messages are not redacted
+        self._check_redactions(originals, channel.json_body["chunk"], False)
+
+    def test_MSC4293_flag_ignored_in_other_membership_events(self) -> None:
+        self.helper.join(self.room_id, self.bad_user_id, tok=self.bad_tok)
+
+        # bad user sends some messages
+        original_ids = []
+        for i in range(15):
+            event = {"body": f"being a menace {i}", "msgtype": "m.text"}
+            res = self.helper.send_event(
+                self.room_id, "m.room.message", event, tok=self.bad_tok, expect_code=200
+            )
+            original_ids.append(res["event_id"])
+
+        # grab original events before ban
+        originals = [self.get_success(self.store.get_event(x)) for x in original_ids]
+
+        # bad user leaves on their own with flag
+        content = {
+            "org.matrix.msc4293.redact_events": True,
+        }
+        self.helper.change_membership(
+            self.room_id,
+            self.bad_user_id,
+            self.bad_user_id,
+            "leave",
+            content,
+            self.bad_tok,
+        )
+
+        # their messages are not redacted
+        filter = json.dumps({"types": [EventTypes.Message]})
+        channel = self.make_request(
+            "GET",
+            f"rooms/{self.room_id}/messages?filter={filter}&limit=50",
+            access_token=self.creator_tok,
+        )
+        self.assertEqual(channel.code, 200)
+        self._check_redactions(originals, channel.json_body["chunk"], False)
+
+        # bad user is invited with flag in invite event
+        content = {
+            "org.matrix.msc4293.redact_events": True,
+        }
+        self.helper.change_membership(
+            self.room_id,
+            self.creator,
+            self.bad_user_id,
+            "invite",
+            content,
+            self.creator_tok,
+        )
+
+        # their messages are still not redacted
+        filter = json.dumps({"types": [EventTypes.Message]})
+        channel = self.make_request(
+            "GET",
+            f"rooms/{self.room_id}/messages?filter={filter}&limit=50",
+            access_token=self.creator_tok,
+        )
+        self.assertEqual(channel.code, 200)
+        self._check_redactions(originals, channel.json_body["chunk"], False)
+
+        # bad user joins with flag in invite event
+        content = {
+            "org.matrix.msc4293.redact_events": True,
+        }
+        self.helper.change_membership(
+            self.room_id,
+            self.bad_user_id,
+            self.bad_user_id,
+            "join",
+            content,
+            self.bad_tok,
+        )
+
+        # and still their messages are not redacted
+        filter = json.dumps({"types": [EventTypes.Message]})
+        channel = self.make_request(
+            "GET",
+            f"rooms/{self.room_id}/messages?filter={filter}&limit=50",
+            access_token=self.creator_tok,
+        )
+        self.assertEqual(channel.code, 200)
+        self._check_redactions(originals, channel.json_body["chunk"], False)
+
+    def test_MSC4293_redaction_applied_via_kick_api(self) -> None:
+        """
+        Test that MSC4239 field passed through and applied when using /kick
+        """
+        self.helper.join(self.room_id, self.bad_user_id, tok=self.bad_tok)
+
+        # bad user sends some messages
+        original_ids = []
+        for i in range(15):
+            event = {"body": f"being a menace {i}", "msgtype": "m.text"}
+            res = self.helper.send_event(
+                self.room_id, "m.room.message", event, tok=self.bad_tok, expect_code=200
+            )
+            original_ids.append(res["event_id"])
+
+        # grab original events before kick
+        originals = [self.get_success(self.store.get_event(x)) for x in original_ids]
+
+        channel = self.make_request(
+            "POST",
+            f"/_matrix/client/v3/rooms/{self.room_id}/kick",
+            access_token=self.creator_tok,
+            content={
+                "reason": "being annoying",
+                "org.matrix.msc4293.redact_events": True,
+                "user_id": self.bad_user_id,
+            },
+            shorthand=False,
+        )
+        self.assertEqual(channel.code, 200)
+
+        filter = json.dumps({"types": [EventTypes.Message]})
+        channel = self.make_request(
+            "GET",
+            f"rooms/{self.room_id}/messages?filter={filter}&limit=50",
+            access_token=self.creator_tok,
+        )
+        self.assertEqual(channel.code, 200)
+        self._check_redactions(
+            originals,
+            channel.json_body["chunk"],
+            expect_redaction=True,
+            reason="being annoying",
+        )
+
+    def test_MSC4293_redaction_applied_via_ban_api(self) -> None:
+        """
+        Test that MSC4239 field passed through and applied when using /ban
+        """
+        self.helper.join(self.room_id, self.bad_user_id, tok=self.bad_tok)
+
+        # bad user sends some messages
+        original_ids = []
+        for i in range(15):
+            event = {"body": f"being a menace {i}", "msgtype": "m.text"}
+            res = self.helper.send_event(
+                self.room_id, "m.room.message", event, tok=self.bad_tok, expect_code=200
+            )
+            original_ids.append(res["event_id"])
+
+        # grab original events before ban
+        originals = [self.get_success(self.store.get_event(x)) for x in original_ids]
+
+        channel = self.make_request(
+            "POST",
+            f"/_matrix/client/v3/rooms/{self.room_id}/ban",
+            access_token=self.creator_tok,
+            content={
+                "reason": "being disruptive",
+                "org.matrix.msc4293.redact_events": True,
+                "user_id": self.bad_user_id,
+            },
+            shorthand=False,
+        )
+        self.assertEqual(channel.code, 200)
+
+        filter = json.dumps({"types": [EventTypes.Message]})
+        channel = self.make_request(
+            "GET",
+            f"rooms/{self.room_id}/messages?filter={filter}&limit=50",
+            access_token=self.creator_tok,
+        )
+        self.assertEqual(channel.code, 200)
+        self._check_redactions(
+            originals,
+            channel.json_body["chunk"],
+            expect_redaction=True,
+            reason="being disruptive",
+        )
+
+
+class CreateRoomRemoteInviteTestCase(unittest.FederatingHomeserverTestCase):
+    """
+    Tests error propagation from remote invites during /createRoom.
+
+    Regression test for https://github.com/element-hq/synapse/security/advisories/GHSA-95fh-hv8c-chvq.
+    """
+
+    servlets = [
+        room.register_servlets,
+        login.register_servlets,
+        register.register_servlets,
+        admin.register_servlets,
+    ]
+
+    hijack_auth = False
+
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.user_id = self.register_user("creator", "test")
+        self.token = self.login("creator", "test")
+
+    def _mock_remote_invite_http_error(
+        self,
+        status: int,
+        error_body: JsonDict,
+    ) -> None:
+        """
+        Make the remote homeserver reply to its `/invite` endpoint with an error.
+
+        Args:
+            status: the HTTP status to return
+            error_body: the JSON error body to return
+        """
+        federation_http_client = self.hs.get_federation_http_client()
+
+        fake_agent = create_autospec(Agent, spec_set=True)
+
+        def request(
+            method: bytes,
+            uri: bytes,
+            headers: object = None,
+            bodyProducer: object = None,
+        ) -> "defer.Deferred":
+            # For our test, we don't expect any other outbound request
+            assert b"/invite/" in uri, f"unexpected outbound request to {uri!r}"
+            return defer.succeed(
+                FakeResponse.json(
+                    code=status,
+                    payload=error_body,
+                )
+            )
+
+        fake_agent.request.side_effect = request
+        federation_http_client.agent = fake_agent
+
+    @parameterized.expand(
+        (
+            (
+                HTTPStatus.IM_A_TEAPOT,
+                {
+                    "errcode": "M_FORBIDDEN",
+                    "error": "You can't invite this user",
+                },
+                HTTPStatus.IM_A_TEAPOT,
+                {
+                    "errcode": "M_FORBIDDEN",
+                    "error": "You can't invite this user",
+                },
+            ),
+            # This case is https://github.com/element-hq/synapse/security/advisories/GHSA-95fh-hv8c-chvq
+            # The error is rewritten for safety.
+            (
+                HTTPStatus.UNAUTHORIZED,
+                {"errcode": "M_UNKNOWN_TOKEN", "error": "unknown token"},
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "errcode": "M_UNKNOWN",
+                    "error": "unknown token",
+                },
+            ),
+        )
+    )
+    def test_remote_invite_bubbles_errors(
+        self,
+        policy_server_error_status: HTTPStatus,
+        policy_server_error_body: JsonDict,
+        expected_client_facing_error_status: HTTPStatus,
+        expected_client_facing_error_body: JsonDict,
+    ) -> None:
+        """
+        Test that, when creating a room involving a remote invite,
+        when the remote homeserver returns an error, we bubble it
+        to the client carefully.
+
+        Regression test for https://github.com/element-hq/synapse/security/advisories/GHSA-95fh-hv8c-chvq
+        """
+        # Mock the remote homeserver (at the HTTP level) to return the configured error
+        self._mock_remote_invite_http_error(
+            policy_server_error_status,
+            policy_server_error_body,
+        )
+
+        channel = self.make_request(
+            "POST",
+            "/createRoom",
+            {"invite": ["@alice:" + self.OTHER_SERVER_NAME]},
+            access_token=self.token,
+        )
+
+        self.assertEqual(
+            channel.code, expected_client_facing_error_status, channel.result
+        )
+        self.assertEqual(channel.json_body, expected_client_facing_error_body)

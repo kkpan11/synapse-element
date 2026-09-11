@@ -24,27 +24,15 @@ import os
 import signal
 from types import FrameType, TracebackType
 from typing import (
-    Any,
-    Callable,
-    Dict,
-    List,
     Literal,
-    Optional,
-    Tuple,
-    Type,
     TypeVar,
-    Union,
     overload,
 )
-
-import attr
-from typing_extensions import ParamSpec
 
 from synapse.api.constants import EventTypes
 from synapse.api.room_versions import RoomVersions
 from synapse.config.homeserver import HomeServerConfig
 from synapse.config.server import DEFAULT_ROOM_VERSION
-from synapse.logging.context import current_context, set_current_context
 from synapse.server import HomeServer
 from synapse.storage.database import LoggingDatabaseConnection
 from synapse.storage.engines import create_engine
@@ -113,7 +101,12 @@ def setupdb() -> None:
             port=POSTGRES_PORT,
             password=POSTGRES_PASSWORD,
         )
-        logging_conn = LoggingDatabaseConnection(db_conn, db_engine, "tests")
+        logging_conn = LoggingDatabaseConnection(
+            conn=db_conn,
+            engine=db_engine,
+            default_txn_name="tests",
+            server_name="test_server",
+        )
         prepare_database(logging_conn, db_engine, None)
         logging_conn.close()
 
@@ -135,21 +128,27 @@ def setupdb() -> None:
 
 
 @overload
-def default_config(name: str, parse: Literal[False] = ...) -> Dict[str, object]: ...
+def default_config(
+    *, server_name: str, parse: Literal[False] = ...
+) -> dict[str, object]: ...
 
 
 @overload
-def default_config(name: str, parse: Literal[True]) -> HomeServerConfig: ...
+def default_config(*, server_name: str, parse: Literal[True]) -> HomeServerConfig: ...
 
 
 def default_config(
-    name: str, parse: bool = False
-) -> Union[Dict[str, object], HomeServerConfig]:
+    *, server_name: str, parse: bool = False
+) -> dict[str, object] | HomeServerConfig:
     """
     Create a reasonable test config.
+
+    Args:
+        server_name: homeserver name
+        parse: TODO
     """
     config_dict = {
-        "server_name": name,
+        "server_name": server_name,
         # Setting this to an empty list turns off federation sending.
         "federation_sender_instances": [],
         "media_store_path": "media",
@@ -199,7 +198,9 @@ def default_config(
         "rc_invites": {
             "per_room": {"per_second": 10000, "burst_count": 10000},
             "per_user": {"per_second": 10000, "burst_count": 10000},
+            "per_issuer": {"per_second": 10000, "burst_count": 10000},
         },
+        "rc_room_creation": {"per_second": 10000, "burst_count": 10000},
         "rc_3pid_validation": {"per_second": 10000, "burst_count": 10000},
         "rc_presence": {"per_user": {"per_second": 10000, "burst_count": 10000}},
         "saml2_enabled": False,
@@ -242,101 +243,6 @@ def mock_getRawHeaders(headers=None):  # type: ignore[no-untyped-def]
     return getRawHeaders
 
 
-P = ParamSpec("P")
-
-
-@attr.s(slots=True, auto_attribs=True)
-class Timer:
-    absolute_time: float
-    callback: Callable[[], None]
-    expired: bool
-
-
-# TODO: Make this generic over a ParamSpec?
-@attr.s(slots=True, auto_attribs=True)
-class Looper:
-    func: Callable[..., Any]
-    interval: float  # seconds
-    last: float
-    args: Tuple[object, ...]
-    kwargs: Dict[str, object]
-
-
-class MockClock:
-    now = 1000.0
-
-    def __init__(self) -> None:
-        # Timers in no particular order
-        self.timers: List[Timer] = []
-        self.loopers: List[Looper] = []
-
-    def time(self) -> float:
-        return self.now
-
-    def time_msec(self) -> int:
-        return int(self.time() * 1000)
-
-    def call_later(
-        self,
-        delay: float,
-        callback: Callable[P, object],
-        *args: P.args,
-        **kwargs: P.kwargs,
-    ) -> Timer:
-        ctx = current_context()
-
-        def wrapped_callback() -> None:
-            set_current_context(ctx)
-            callback(*args, **kwargs)
-
-        t = Timer(self.now + delay, wrapped_callback, False)
-        self.timers.append(t)
-
-        return t
-
-    def looping_call(
-        self,
-        function: Callable[P, object],
-        interval: float,
-        *args: P.args,
-        **kwargs: P.kwargs,
-    ) -> None:
-        self.loopers.append(Looper(function, interval / 1000.0, self.now, args, kwargs))
-
-    def cancel_call_later(self, timer: Timer, ignore_errs: bool = False) -> None:
-        if timer.expired:
-            if not ignore_errs:
-                raise Exception("Cannot cancel an expired timer")
-
-        timer.expired = True
-        self.timers = [t for t in self.timers if t != timer]
-
-    # For unit testing
-    def advance_time(self, secs: float) -> None:
-        self.now += secs
-
-        timers = self.timers
-        self.timers = []
-
-        for t in timers:
-            if t.expired:
-                raise Exception("Timer already expired")
-
-            if self.now >= t.absolute_time:
-                t.expired = True
-                t.callback()
-            else:
-                self.timers.append(t)
-
-        for looped in self.loopers:
-            if looped.last + looped.interval < self.now:
-                looped.func(*looped.args, **looped.kwargs)
-                looped.last = self.now
-
-    def advance_time_msec(self, ms: float) -> None:
-        self.advance_time(ms / 1000.0)
-
-
 async def create_room(hs: HomeServer, room_id: str, creator_id: str) -> None:
     """Creates and persist a creation event for the given room"""
 
@@ -375,7 +281,7 @@ async def create_room(hs: HomeServer, room_id: str, creator_id: str) -> None:
 T = TypeVar("T")
 
 
-def checked_cast(type: Type[T], x: object) -> T:
+def checked_cast(type: type[T], x: object) -> T:
     """A version of typing.cast that is checked at runtime.
 
     We have our own function for this for two reasons:
@@ -412,25 +318,49 @@ class test_timeout:
             my_checking_func()
             time.sleep(0.1)
     ```
+
+    Args:
+        seconds: How long to allow the block to run for before raising
+            `TestTimeout`.
+        error_message: Extra text to append to the `TestTimeout` message.
+        cpu_time: If `True`, `seconds` is a budget of CPU time (user + system,
+            across all threads) consumed by the process rather than wall-clock
+            time. Useful for performance-regression tests, as time spent
+            blocked on I/O (e.g. waiting on the database) or lost to a loaded
+            CI machine doesn't count against the budget. Note that a block
+            which hangs while consuming *no* CPU will never trip this variant.
     """
 
-    def __init__(self, seconds: int, error_message: Optional[str] = None) -> None:
-        self.error_message = f"Test timed out after {seconds}s"
+    def __init__(
+        self,
+        seconds: float,
+        error_message: str | None = None,
+        *,
+        cpu_time: bool = False,
+    ) -> None:
+        self.error_message = f"Test timed out after {seconds}s of {'CPU' if cpu_time else 'wall-clock'} time"
         if error_message is not None:
             self.error_message += f": {error_message}"
         self.seconds = seconds
+        self.cpu_time = cpu_time
 
-    def handle_timeout(self, signum: int, frame: Optional[FrameType]) -> None:
+    def handle_timeout(self, signum: int, frame: FrameType | None) -> None:
         raise TestTimeout(self.error_message)
 
     def __enter__(self) -> None:
-        signal.signal(signal.SIGALRM, self.handle_timeout)
-        signal.alarm(self.seconds)
+        if self.cpu_time:
+            # `ITIMER_PROF` counts down against process CPU time (user +
+            # system) and delivers `SIGPROF` when it expires.
+            signal.signal(signal.SIGPROF, self.handle_timeout)
+            signal.setitimer(signal.ITIMER_PROF, self.seconds)
+        else:
+            signal.signal(signal.SIGALRM, self.handle_timeout)
+            signal.setitimer(signal.ITIMER_REAL, self.seconds)
 
     def __exit__(
         self,
-        exc_type: Optional[Type[BaseException]],
-        exc_val: Optional[BaseException],
-        exc_tb: Optional[TracebackType],
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
     ) -> None:
-        signal.alarm(0)
+        signal.setitimer(signal.ITIMER_PROF if self.cpu_time else signal.ITIMER_REAL, 0)

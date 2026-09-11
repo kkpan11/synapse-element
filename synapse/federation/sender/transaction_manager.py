@@ -18,7 +18,7 @@
 #
 #
 import logging
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Mapping
 
 from prometheus_client import Gauge
 
@@ -26,7 +26,7 @@ from synapse.api.constants import EduTypes
 from synapse.api.errors import HttpResponseException
 from synapse.events import EventBase
 from synapse.federation.persistence import TransactionActions
-from synapse.federation.units import Edu, Transaction
+from synapse.federation.units import Edu, Transaction, serialize_and_filter_pdus
 from synapse.logging.opentracing import (
     extract_text_map,
     set_tag,
@@ -34,8 +34,10 @@ from synapse.logging.opentracing import (
     tags,
     whitelisted_homeserver,
 )
+from synapse.metrics import SERVER_NAME_LABEL
+from synapse.module_api.callbacks.federation import FederatedEventDeliveryMethod
 from synapse.types import JsonDict
-from synapse.util import json_decoder
+from synapse.util.json import json_decoder
 from synapse.util.metrics import measure_func
 
 if TYPE_CHECKING:
@@ -47,7 +49,7 @@ issue_8631_logger = logging.getLogger("synapse.8631_debug")
 last_pdu_ts_metric = Gauge(
     "synapse_federation_last_sent_pdu_time",
     "The timestamp of the last PDU which was successfully sent to the given domain",
-    labelnames=("server_name",),
+    labelnames=("destination_server_name", SERVER_NAME_LABEL),
 )
 
 
@@ -58,11 +60,12 @@ class TransactionManager:
     """
 
     def __init__(self, hs: "synapse.server.HomeServer"):
-        self._server_name = hs.hostname
+        self.server_name = hs.hostname  # nb must be called this for @measure_func
         self.clock = hs.get_clock()  # nb must be called this for @measure_func
         self._store = hs.get_datastores().main
         self._transaction_actions = TransactionActions(self._store)
         self._transport_layer = hs.get_federation_transport_client()
+        self._federation_callbacks = hs.get_module_api_callbacks().federation
 
         self._federation_metrics_domains = (
             hs.config.federation.federation_metrics_domains
@@ -71,12 +74,18 @@ class TransactionManager:
         # HACK to get unique tx id
         self._next_txn_id = int(self.clock.time_msec())
 
+        self._is_shutdown = False
+
+    def shutdown(self) -> None:
+        self._is_shutdown = True
+        self._transport_layer.shutdown()
+
     @measure_func("_send_new_transaction")
     async def send_new_transaction(
         self,
         destination: str,
-        pdus: List[EventBase],
-        edus: List[Edu],
+        pdus: list[EventBase],
+        edus: list[Edu],
     ) -> None:
         """
         Args:
@@ -84,6 +93,12 @@ class TransactionManager:
             pdus: In-order list of PDUs to send
             edus: List of EDUs to send
         """
+
+        if self._is_shutdown:
+            logger.warning(
+                "TransactionManager has been shutdown, not sending transaction"
+            )
+            return
 
         # Make a transaction-sending opentracing span. This span follows on from
         # all the edus in that transaction. This needs to be done since there is
@@ -116,9 +131,9 @@ class TransactionManager:
             transaction = Transaction(
                 origin_server_ts=int(self.clock.time_msec()),
                 transaction_id=txn_id,
-                origin=self._server_name,
+                origin=self.server_name,
                 destination=destination,
-                pdus=[p.get_pdu_json() for p in pdus],
+                pdus=serialize_and_filter_pdus(pdus),
                 edus=[edu.get_dict() for edu in edus],
             )
 
@@ -179,18 +194,44 @@ class TransactionManager:
 
             logger.info("TX [%s] {%s} got 200 response", destination, txn_id)
 
-            for e_id, r in response.get("pdus", {}).items():
-                if "error" in r:
-                    logger.warning(
-                        "TX [%s] {%s} Remote returned error for %s: %s",
+            pdu_responses = response.get("pdus", {})
+            if not isinstance(pdu_responses, Mapping):
+                logger.warning(
+                    "TX [%s] {%s} Remote returned invalid type for `pdus`",
+                    destination,
+                    txn_id,
+                )
+            else:
+                for event_id, pdu_response in pdu_responses.items():
+                    if not isinstance(pdu_response, Mapping) or "error" in pdu_response:
+                        logger.warning(
+                            "TX [%s] {%s} Remote returned error for %s: %s",
+                            destination,
+                            txn_id,
+                            event_id,
+                            pdu_response,
+                        )
+
+                # If modules have requested to be notified about delivered events,
+                # build and send that notification.
+                if self._federation_callbacks.interested_in_events_delivered_over_federation():
+                    # A PDU is considered acknowledged when the remote echoes the event_id back to
+                    # us, without an error in the PDU response dict.
+                    acknowledged_pdu_ids = {
+                        event_id
+                        for event_id, pdu_response in response.get("pdus", {}).items()
+                        if isinstance(pdu_response, Mapping)
+                        and "error" not in pdu_response
+                    }
+                    await self._federation_callbacks.notify_on_event_delivered_over_federation(
                         destination,
-                        txn_id,
-                        e_id,
-                        r,
+                        [p for p in pdus if p.event_id in acknowledged_pdu_ids],
+                        FederatedEventDeliveryMethod.SEND,
                     )
 
             if pdus and destination in self._federation_metrics_domains:
                 last_pdu = pdus[-1]
-                last_pdu_ts_metric.labels(server_name=destination).set(
-                    last_pdu.origin_server_ts / 1000
-                )
+                last_pdu_ts_metric.labels(
+                    destination_server_name=destination,
+                    **{SERVER_NAME_LABEL: self.server_name},
+                ).set(last_pdu.origin_server_ts / 1000)

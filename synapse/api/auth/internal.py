@@ -29,6 +29,7 @@ from synapse.api.errors import (
     InvalidClientTokenError,
     MissingClientTokenError,
     UnrecognizedRequestError,
+    UserLockedError,
 )
 from synapse.http.site import SynapseRequest
 from synapse.logging.opentracing import active_span, force_tracing, start_active_span
@@ -105,8 +106,8 @@ class InternalAuth(BaseAuth):
                 parent_span.set_tag("user_id", requester.user.to_string())
                 if requester.device_id is not None:
                     parent_span.set_tag("device_id", requester.device_id)
-                if requester.app_service is not None:
-                    parent_span.set_tag("appservice_id", requester.app_service.id)
+                if requester.app_service_id is not None:
+                    parent_span.set_tag("appservice_id", requester.app_service_id)
             return requester
 
     async def get_user_by_req_experimental_feature(
@@ -162,12 +163,7 @@ class InternalAuth(BaseAuth):
                 if not allow_locked and await self.store.get_user_locked_status(
                     requester.user.to_string()
                 ):
-                    raise AuthError(
-                        401,
-                        "User account has been locked",
-                        errcode=Codes.USER_LOCKED,
-                        additional_fields={"soft_logout": True},
-                    )
+                    raise UserLockedError()
 
                 # Deny the request if the user account has expired.
                 # This check is only done for regular users, not appservice ones.
@@ -300,4 +296,4 @@ class InternalAuth(BaseAuth):
         Returns:
             True if the user is an admin
         """
-        return await self.store.is_server_admin(requester.user)
+        return await self.store.is_server_admin(requester.user.to_string())

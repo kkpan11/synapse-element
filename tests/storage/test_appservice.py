@@ -21,15 +21,19 @@
 import json
 import os
 import tempfile
-from typing import List, cast
+from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
 
 import yaml
 
 from twisted.internet import defer
-from twisted.test.proto_helpers import MemoryReactor
+from twisted.internet.testing import MemoryReactor
 
-from synapse.appservice import ApplicationService, ApplicationServiceState
+from synapse.appservice import (
+    ApplicationService,
+    ApplicationServiceState,
+    Scopes,
+)
 from synapse.config._base import ConfigError
 from synapse.events import EventBase
 from synapse.server import HomeServer
@@ -39,7 +43,7 @@ from synapse.storage.databases.main.appservice import (
     ApplicationServiceTransactionStore,
 )
 from synapse.types import DeviceListUpdates
-from synapse.util import Clock
+from synapse.util.clock import Clock
 
 from tests import unittest
 
@@ -48,7 +52,7 @@ class ApplicationServiceStoreTestCase(unittest.HomeserverTestCase):
     def setUp(self) -> None:
         super().setUp()
 
-        self.as_yaml_files: List[str] = []
+        self.as_yaml_files: list[str] = []
 
         self.hs.config.appservice.app_service_config_files = self.as_yaml_files
         self.hs.config.caches.event_cache_size = 1
@@ -63,9 +67,15 @@ class ApplicationServiceStoreTestCase(unittest.HomeserverTestCase):
         self._add_appservice("token3", "as3", "some_url", "some_hs_token", "bob")
         # must be done after inserts
         database = self.hs.get_datastores().databases[0]
+        self.server_name = self.hs.hostname
         self.store = ApplicationServiceStore(
             database,
-            make_conn(database._database_config, database.engine, "test"),
+            make_conn(
+                db_config=database._database_config,
+                engine=database.engine,
+                default_txn_name="test",
+                server_name=self.server_name,
+            ),
             self.hs,
         )
 
@@ -117,7 +127,7 @@ class ApplicationServiceStoreTestCase(unittest.HomeserverTestCase):
 class ApplicationServiceTransactionStoreTestCase(unittest.HomeserverTestCase):
     def setUp(self) -> None:
         super().setUp()
-        self.as_yaml_files: List[str] = []
+        self.as_yaml_files: list[str] = []
 
         self.hs.config.appservice.app_service_config_files = self.as_yaml_files
         self.hs.config.caches.event_cache_size = 1
@@ -138,9 +148,17 @@ class ApplicationServiceTransactionStoreTestCase(unittest.HomeserverTestCase):
         self.db_pool = database._db_pool
         self.engine = database.engine
 
+        server_name = self.hs.hostname
         db_config = self.hs.config.database.get_single_database()
         self.store = TestTransactionStore(
-            database, make_conn(db_config, self.engine, "test"), self.hs
+            database,
+            make_conn(
+                db_config=db_config,
+                engine=self.engine,
+                default_txn_name="test",
+                server_name=server_name,
+            ),
+            self.hs,
         )
 
     def _add_service(self, url: str, as_token: str, id: str) -> None:
@@ -166,7 +184,7 @@ class ApplicationServiceTransactionStoreTestCase(unittest.HomeserverTestCase):
         )
 
     def _insert_txn(
-        self, as_id: str, txn_id: int, events: List[Mock]
+        self, as_id: str, txn_id: int, events: list[Mock]
     ) -> "defer.Deferred[None]":
         return self.db_pool.runOperation(
             self.engine.convert_param_style(
@@ -263,7 +281,7 @@ class ApplicationServiceTransactionStoreTestCase(unittest.HomeserverTestCase):
         self,
     ) -> None:
         service = Mock(id=self.as_list[0]["id"])
-        events = cast(List[EventBase], [Mock(event_id="e1"), Mock(event_id="e2")])
+        events = cast(list[EventBase], [Mock(event_id="e1"), Mock(event_id="e2")])
         txn = self.get_success(
             defer.ensureDeferred(
                 self.store.create_appservice_txn(
@@ -465,8 +483,8 @@ class TestTransactionStore(ApplicationServiceTransactionStore, ApplicationServic
 
 
 class ApplicationServiceStoreConfigTestCase(unittest.HomeserverTestCase):
-    def _write_config(self, suffix: str, **kwargs: str) -> str:
-        vals = {
+    def _write_config(self, suffix: str, **kwargs: str | list[str] | None) -> str:
+        vals: dict[str, Any] = {
             "id": "id" + suffix,
             "url": "url" + suffix,
             "as_token": "as_token" + suffix,
@@ -488,10 +506,16 @@ class ApplicationServiceStoreConfigTestCase(unittest.HomeserverTestCase):
         self.hs.config.appservice.app_service_config_files = [f1, f2]
         self.hs.config.caches.event_cache_size = 1
 
+        server_name = self.hs.hostname
         database = self.hs.get_datastores().databases[0]
         ApplicationServiceStore(
             database,
-            make_conn(database._database_config, database.engine, "test"),
+            make_conn(
+                db_config=database._database_config,
+                engine=database.engine,
+                default_txn_name="test",
+                server_name=server_name,
+            ),
             self.hs,
         )
 
@@ -503,10 +527,16 @@ class ApplicationServiceStoreConfigTestCase(unittest.HomeserverTestCase):
         self.hs.config.caches.event_cache_size = 1
 
         with self.assertRaises(ConfigError) as cm:
+            server_name = self.hs.hostname
             database = self.hs.get_datastores().databases[0]
             ApplicationServiceStore(
                 database,
-                make_conn(database._database_config, database.engine, "test"),
+                make_conn(
+                    db_config=database._database_config,
+                    engine=database.engine,
+                    default_txn_name="test",
+                    server_name=server_name,
+                ),
                 self.hs,
             )
 
@@ -523,10 +553,16 @@ class ApplicationServiceStoreConfigTestCase(unittest.HomeserverTestCase):
         self.hs.config.caches.event_cache_size = 1
 
         with self.assertRaises(ConfigError) as cm:
+            server_name = self.hs.hostname
             database = self.hs.get_datastores().databases[0]
             ApplicationServiceStore(
                 database,
-                make_conn(database._database_config, database.engine, "test"),
+                make_conn(
+                    db_config=database._database_config,
+                    engine=database.engine,
+                    default_txn_name="test",
+                    server_name=server_name,
+                ),
                 self.hs,
             )
 
@@ -534,3 +570,297 @@ class ApplicationServiceStoreConfigTestCase(unittest.HomeserverTestCase):
         self.assertIn(f1, str(e))
         self.assertIn(f2, str(e))
         self.assertIn("as_token", str(e))
+
+    def test_invalid_scopes_raises(self) -> None:
+        f = self._write_config(
+            suffix="1", **{"io.element.msc4502.scopes": "not-a-list"}
+        )
+
+        self.hs.config.appservice.app_service_config_files = [f]
+        self.hs.config.caches.event_cache_size = 1
+
+        server_name = self.hs.hostname
+        database = self.hs.get_datastores().databases[0]
+        with self.assertRaises(ValueError):
+            ApplicationServiceStore(
+                database,
+                make_conn(
+                    db_config=database._database_config,
+                    engine=database.engine,
+                    default_txn_name="test",
+                    server_name=server_name,
+                ),
+                self.hs,
+            )
+
+    def test_known_scope_works(self) -> None:
+        f = self._write_config(
+            suffix="1",
+            **{"io.element.msc4502.scopes": [Scopes.QUERY_ROOM_MEMBERSHIP.value]},
+        )
+
+        self.hs.config.appservice.app_service_config_files = [f]
+        self.hs.config.caches.event_cache_size = 1
+
+        server_name = self.hs.hostname
+        database = self.hs.get_datastores().databases[0]
+        ApplicationServiceStore(
+            database,
+            make_conn(
+                db_config=database._database_config,
+                engine=database.engine,
+                default_txn_name="test",
+                server_name=server_name,
+            ),
+            self.hs,
+        )
+
+    def test_unknown_scope_raises(self) -> None:
+        f = self._write_config(
+            suffix="1", **{"io.element.msc4502.scopes": ["does:not:exist"]}
+        )
+
+        self.hs.config.appservice.app_service_config_files = [f]
+        self.hs.config.caches.event_cache_size = 1
+
+        server_name = self.hs.hostname
+        database = self.hs.get_datastores().databases[0]
+        with self.assertRaises(ValueError):
+            ApplicationServiceStore(
+                database,
+                make_conn(
+                    db_config=database._database_config,
+                    engine=database.engine,
+                    default_txn_name="test",
+                    server_name=server_name,
+                ),
+                self.hs,
+            )
+
+    def test_proxy_prefix_works(self) -> None:
+        f1 = self._write_config(
+            suffix="1",
+            **{
+                "io.element.msc4512.proxy_prefix": "rtc/livekit",
+                "io.element.msc4512.proxy_url": "http://proxy",
+            },
+        )
+
+        self.hs.config.appservice.app_service_config_files = [f1]
+        self.hs.config.caches.event_cache_size = 1
+
+        server_name = self.hs.hostname
+        database = self.hs.get_datastores().databases[0]
+        store = ApplicationServiceStore(
+            database,
+            make_conn(
+                db_config=database._database_config,
+                engine=database.engine,
+                default_txn_name="test",
+                server_name=server_name,
+            ),
+            self.hs,
+        )
+        (appservice,) = store.get_app_services()
+        self.assertEqual(appservice.proxy_prefix, "rtc/livekit")
+        self.assertEqual(appservice.proxy_url, "http://proxy")
+
+    def test_proxy_prefix_requires_proxy_url(self) -> None:
+        f1 = self._write_config(
+            suffix="1",
+            **{"io.element.msc4512.proxy_prefix": "rtc/livekit"},
+        )
+
+        self.hs.config.appservice.app_service_config_files = [f1]
+        self.hs.config.caches.event_cache_size = 1
+
+        with self.assertRaises(KeyError):
+            server_name = self.hs.hostname
+            database = self.hs.get_datastores().databases[0]
+            ApplicationServiceStore(
+                database,
+                make_conn(
+                    db_config=database._database_config,
+                    engine=database.engine,
+                    default_txn_name="test",
+                    server_name=server_name,
+                ),
+                self.hs,
+            )
+
+    def test_proxy_url_requires_proxy_prefix(self) -> None:
+        f1 = self._write_config(
+            suffix="1",
+            **{"io.element.msc4512.proxy_url": "http://proxy"},
+        )
+
+        self.hs.config.appservice.app_service_config_files = [f1]
+        self.hs.config.caches.event_cache_size = 1
+
+        with self.assertRaises(KeyError):
+            server_name = self.hs.hostname
+            database = self.hs.get_datastores().databases[0]
+            ApplicationServiceStore(
+                database,
+                make_conn(
+                    db_config=database._database_config,
+                    engine=database.engine,
+                    default_txn_name="test",
+                    server_name=server_name,
+                ),
+                self.hs,
+            )
+
+    def test_proxy_prefix_requires_non_empty_proxy_url(self) -> None:
+        f1 = self._write_config(
+            suffix="1",
+            **{
+                "io.element.msc4512.proxy_prefix": "rtc/livekit",
+                "io.element.msc4512.proxy_url": "",
+            },
+        )
+
+        self.hs.config.appservice.app_service_config_files = [f1]
+        self.hs.config.caches.event_cache_size = 1
+
+        with self.assertRaises(ValueError):
+            server_name = self.hs.hostname
+            database = self.hs.get_datastores().databases[0]
+            ApplicationServiceStore(
+                database,
+                make_conn(
+                    db_config=database._database_config,
+                    engine=database.engine,
+                    default_txn_name="test",
+                    server_name=server_name,
+                ),
+                self.hs,
+            )
+
+    def test_proxy_url_requires_non_empty_proxy_prefix(self) -> None:
+        f1 = self._write_config(
+            suffix="1",
+            **{
+                "io.element.msc4512.proxy_prefix": "",
+                "io.element.msc4512.proxy_url": "http://proxy",
+            },
+        )
+
+        self.hs.config.appservice.app_service_config_files = [f1]
+        self.hs.config.caches.event_cache_size = 1
+
+        with self.assertRaises(ValueError):
+            server_name = self.hs.hostname
+            database = self.hs.get_datastores().databases[0]
+            ApplicationServiceStore(
+                database,
+                make_conn(
+                    db_config=database._database_config,
+                    engine=database.engine,
+                    default_txn_name="test",
+                    server_name=server_name,
+                ),
+                self.hs,
+            )
+
+    def test_proxy_prefix_does_not_allow_reserved_values(self) -> None:
+        f1 = self._write_config(
+            suffix="1",
+            **{
+                "io.element.msc4512.proxy_prefix": "not/allowed",
+                "io.element.msc4512.proxy_url": "http://proxy",
+            },
+        )
+
+        self.hs.config.appservice.app_service_config_files = [f1]
+        self.hs.config.caches.event_cache_size = 1
+
+        with self.assertRaises(ValueError):
+            server_name = self.hs.hostname
+            database = self.hs.get_datastores().databases[0]
+            ApplicationServiceStore(
+                database,
+                make_conn(
+                    db_config=database._database_config,
+                    engine=database.engine,
+                    default_txn_name="test",
+                    server_name=server_name,
+                ),
+                self.hs,
+            )
+
+    def test_duplicate_proxy_prefix(self) -> None:
+        f1 = self._write_config(
+            suffix="1",
+            **{
+                "io.element.msc4512.proxy_prefix": "rtc/livekit",
+                "io.element.msc4512.proxy_url": "http://proxy",
+            },
+        )
+        f2 = self._write_config(
+            suffix="2",
+            **{
+                "io.element.msc4512.proxy_prefix": "rtc/livekit",
+                "io.element.msc4512.proxy_url": "http://proxy2",
+            },
+        )
+
+        self.hs.config.appservice.app_service_config_files = [f1, f2]
+        self.hs.config.caches.event_cache_size = 1
+
+        with self.assertRaises(ConfigError) as cm:
+            server_name = self.hs.hostname
+            database = self.hs.get_datastores().databases[0]
+            ApplicationServiceStore(
+                database,
+                make_conn(
+                    db_config=database._database_config,
+                    engine=database.engine,
+                    default_txn_name="test",
+                    server_name=server_name,
+                ),
+                self.hs,
+            )
+
+        e = cm.exception
+        self.assertIn(f1, str(e))
+        self.assertIn(f2, str(e))
+        self.assertIn("io.element.msc4512.proxy_prefix", str(e))
+
+    def test_overlapping_proxy_prefix(self) -> None:
+        f1 = self._write_config(
+            suffix="1",
+            **{
+                "io.element.msc4512.proxy_prefix": "rtc/livekit",
+                "io.element.msc4512.proxy_url": "http://proxy",
+            },
+        )
+        f2 = self._write_config(
+            suffix="2",
+            **{
+                "io.element.msc4512.proxy_prefix": "rtc/livekit/foobar",
+                "io.element.msc4512.proxy_url": "http://proxy2",
+            },
+        )
+
+        self.hs.config.appservice.app_service_config_files = [f1, f2]
+        self.hs.config.caches.event_cache_size = 1
+
+        with self.assertRaises(ConfigError) as cm:
+            server_name = self.hs.hostname
+            database = self.hs.get_datastores().databases[0]
+            ApplicationServiceStore(
+                database,
+                make_conn(
+                    db_config=database._database_config,
+                    engine=database.engine,
+                    default_txn_name="test",
+                    server_name=server_name,
+                ),
+                self.hs,
+            )
+
+        e = cm.exception
+        self.assertIn(f1, str(e))
+        self.assertIn(f2, str(e))
+        self.assertIn("io.element.msc4512.proxy_prefix", str(e))

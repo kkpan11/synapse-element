@@ -4,6 +4,7 @@
 # Copyright 2019-2021 Matrix.org Federation C.I.C
 # Copyright 2015, 2016 OpenMarket Ltd
 # Copyright (C) 2023 New Vector, Ltd
+# Copyright (C) 2025 Element Creations Ltd
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as
@@ -19,6 +20,7 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
+import copy
 import logging
 import random
 from typing import (
@@ -27,12 +29,8 @@ from typing import (
     Awaitable,
     Callable,
     Collection,
-    Dict,
-    List,
     Mapping,
-    Optional,
-    Tuple,
-    Union,
+    Sequence,
 )
 
 from prometheus_client import Counter, Gauge, Histogram
@@ -59,7 +57,8 @@ from synapse.api.errors import (
 from synapse.api.room_versions import KNOWN_ROOM_VERSIONS, RoomVersion
 from synapse.crypto.event_signing import compute_event_signature
 from synapse.events import EventBase
-from synapse.events.snapshot import EventContext
+from synapse.events.py_protocol import supports_msc4242_state_dag
+from synapse.events.snapshot import EventPersistencePair
 from synapse.federation.federation_base import (
     FederationBase,
     InvalidEventSignatureError,
@@ -82,10 +81,11 @@ from synapse.logging.opentracing import (
     tag_args,
     trace,
 )
+from synapse.metrics import SERVER_NAME_LABEL
 from synapse.metrics.background_process_metrics import wrap_as_background_process
+from synapse.module_api.callbacks.federation import FederatedEventDeliveryMethod
 from synapse.replication.http.federation import (
     ReplicationFederationSendEduRestServlet,
-    ReplicationGetQueryRestServlet,
 )
 from synapse.storage.databases.main.lock import Lock
 from synapse.storage.databases.main.roommember import extract_heroes_from_room_summary
@@ -94,6 +94,7 @@ from synapse.types import JsonDict, StateMap, UserID, get_domain_from_id
 from synapse.util import unwrapFirstError
 from synapse.util.async_helpers import Linearizer, concurrently_execute, gather_results
 from synapse.util.caches.response_cache import ResponseCache
+from synapse.util.duration import Duration
 from synapse.util.stringutils import parse_server_name
 
 if TYPE_CHECKING:
@@ -105,23 +106,30 @@ TRANSACTION_CONCURRENCY_LIMIT = 10
 
 logger = logging.getLogger(__name__)
 
-received_pdus_counter = Counter("synapse_federation_server_received_pdus", "")
+received_pdus_counter = Counter(
+    "synapse_federation_server_received_pdus", "", labelnames=[SERVER_NAME_LABEL]
+)
 
-received_edus_counter = Counter("synapse_federation_server_received_edus", "")
+received_edus_counter = Counter(
+    "synapse_federation_server_received_edus", "", labelnames=[SERVER_NAME_LABEL]
+)
 
 received_queries_counter = Counter(
-    "synapse_federation_server_received_queries", "", ["type"]
+    "synapse_federation_server_received_queries",
+    "",
+    labelnames=["type", SERVER_NAME_LABEL],
 )
 
 pdu_process_time = Histogram(
     "synapse_federation_server_pdu_process_time",
     "Time taken to process an event",
+    labelnames=[SERVER_NAME_LABEL],
 )
 
 last_pdu_ts_metric = Gauge(
     "synapse_federation_last_received_pdu_time",
     "The timestamp of the last PDU which was successfully received from the given domain",
-    labelnames=("server_name",),
+    labelnames=("origin_server_name", SERVER_NAME_LABEL),
 )
 
 
@@ -137,6 +145,7 @@ class FederationServer(FederationBase):
         self.server_name = hs.hostname
         self.handler = hs.get_federation_handler()
         self._spam_checker_module_callbacks = hs.get_module_api_callbacks().spam_checker
+        self._federation_callbacks = hs.get_module_api_callbacks().federation
         self._federation_event_handler = hs.get_federation_event_handler()
         self.state = hs.get_state_handler()
         self._event_auth_handler = hs.get_event_auth_handler()
@@ -152,15 +161,18 @@ class FederationServer(FederationBase):
         # with FederationHandlerRegistry.
         hs.get_directory_handler()
 
-        self._server_linearizer = Linearizer("fed_server")
+        self._server_linearizer = Linearizer(name="fed_server", clock=hs.get_clock())
 
         # origins that we are currently processing a transaction from.
         # a dict from origin to txn id.
-        self._active_transactions: Dict[str, str] = {}
+        self._active_transactions: dict[str, str] = {}
 
         # We cache results for transaction with the same ID
-        self._transaction_resp_cache: ResponseCache[Tuple[str, str]] = ResponseCache(
-            hs.get_clock(), "fed_txn_handler", timeout_ms=30000
+        self._transaction_resp_cache: ResponseCache[tuple[str, str]] = ResponseCache(
+            clock=hs.get_clock(),
+            name="fed_txn_handler",
+            server_name=self.server_name,
+            timeout=Duration(seconds=30),
         )
 
         self.transaction_actions = TransactionActions(self.store)
@@ -169,11 +181,17 @@ class FederationServer(FederationBase):
 
         # We cache responses to state queries, as they take a while and often
         # come in waves.
-        self._state_resp_cache: ResponseCache[Tuple[str, Optional[str]]] = (
-            ResponseCache(hs.get_clock(), "state_resp", timeout_ms=30000)
+        self._state_resp_cache: ResponseCache[tuple[str, str | None]] = ResponseCache(
+            clock=hs.get_clock(),
+            name="state_resp",
+            server_name=self.server_name,
+            timeout=Duration(seconds=30),
         )
-        self._state_ids_resp_cache: ResponseCache[Tuple[str, str]] = ResponseCache(
-            hs.get_clock(), "state_ids_resp", timeout_ms=30000
+        self._state_ids_resp_cache: ResponseCache[tuple[str, str]] = ResponseCache(
+            clock=hs.get_clock(),
+            name="state_ids_resp",
+            server_name=self.server_name,
+            timeout=Duration(seconds=30),
         )
 
         self._federation_metrics_domains = (
@@ -215,11 +233,11 @@ class FederationServer(FederationBase):
                 )
 
             # We pause a bit so that we don't start handling all rooms at once.
-            await self._clock.sleep(random.uniform(0, 0.1))
+            await self._clock.sleep(Duration(seconds=random.uniform(0, 0.1)))
 
     async def on_backfill_request(
-        self, origin: str, room_id: str, versions: List[str], limit: int
-    ) -> Tuple[int, Dict[str, Any]]:
+        self, origin: str, room_id: str, versions: list[str], limit: int
+    ) -> tuple[int, dict[str, Any]]:
         async with self._server_linearizer.queue((origin, room_id)):
             origin_host, _ = parse_server_name(origin)
             await self.check_server_matches_acl(origin_host, room_id)
@@ -230,11 +248,15 @@ class FederationServer(FederationBase):
 
             res = self._transaction_dict_from_pdus(pdus)
 
+            await self._federation_callbacks.notify_on_event_delivered_over_federation(
+                origin, pdus, FederatedEventDeliveryMethod.BACKFILL
+            )
+
         return 200, res
 
     async def on_timestamp_to_event_request(
         self, origin: str, room_id: str, timestamp: int, direction: Direction
-    ) -> Tuple[int, Dict[str, Any]]:
+    ) -> tuple[int, dict[str, Any]]:
         """When we receive a federated `/timestamp_to_event` request,
         handle all of the logic for validating and fetching the event.
 
@@ -251,6 +273,7 @@ class FederationServer(FederationBase):
             body including `event_id`.
         """
         async with self._server_linearizer.queue((origin, room_id)):
+            await self._event_auth_handler.assert_host_in_room(room_id, origin)
             origin_host, _ = parse_server_name(origin)
             await self.check_server_matches_acl(origin_host, room_id)
 
@@ -280,7 +303,7 @@ class FederationServer(FederationBase):
         transaction_id: str,
         destination: str,
         transaction_data: JsonDict,
-    ) -> Tuple[int, JsonDict]:
+    ) -> tuple[int, JsonDict]:
         # If we receive a transaction we should make sure that kick off handling
         # any old events in the staging area.
         if not self._started_handling_of_staged_events:
@@ -290,7 +313,9 @@ class FederationServer(FederationBase):
             # Start a periodic check for old staged events. This is to handle
             # the case where locks time out, e.g. if another process gets killed
             # without dropping its locks.
-            self._clock.looping_call(self._handle_old_staged_events, 60 * 1000)
+            self._clock.looping_call(
+                self._handle_old_staged_events, Duration(minutes=1)
+            )
 
         # keep this as early as possible to make the calculated origin ts as
         # accurate as possible.
@@ -347,7 +372,7 @@ class FederationServer(FederationBase):
 
     async def _on_incoming_transaction_inner(
         self, origin: str, transaction: Transaction, request_time: int
-    ) -> Tuple[int, Dict[str, Any]]:
+    ) -> tuple[int, dict[str, Any]]:
         # CRITICAL SECTION: the first thing we must do (before awaiting) is
         # add an entry to _active_transactions.
         assert origin not in self._active_transactions
@@ -363,7 +388,7 @@ class FederationServer(FederationBase):
 
     async def _handle_incoming_transaction(
         self, origin: str, transaction: Transaction, request_time: int
-    ) -> Tuple[int, Dict[str, Any]]:
+    ) -> tuple[int, dict[str, Any]]:
         """Process an incoming transaction and return the HTTP response
 
         Args:
@@ -411,7 +436,7 @@ class FederationServer(FederationBase):
 
     async def _handle_pdus_in_txn(
         self, origin: str, transaction: Transaction, request_time: int
-    ) -> Dict[str, dict]:
+    ) -> dict[str, dict]:
         """Process the PDUs in a received transaction.
 
         Args:
@@ -424,25 +449,17 @@ class FederationServer(FederationBase):
             report back to the sending server.
         """
 
-        received_pdus_counter.inc(len(transaction.pdus))
+        received_pdus_counter.labels(**{SERVER_NAME_LABEL: self.server_name}).inc(
+            len(transaction.pdus)
+        )
 
         origin_host, _ = parse_server_name(origin)
 
-        pdus_by_room: Dict[str, List[EventBase]] = {}
+        pdus_by_room: dict[str, list[EventBase]] = {}
 
         newest_pdu_ts = 0
 
         for p in transaction.pdus:
-            # FIXME (richardv): I don't think this works:
-            #  https://github.com/matrix-org/synapse/issues/8429
-            if "unsigned" in p:
-                unsigned = p["unsigned"]
-                if "age" in unsigned:
-                    p["age"] = unsigned["age"]
-            if "age" in p:
-                p["age_ts"] = request_time - int(p["age"])
-                del p["age"]
-
             # We try and pull out an event ID so that if later checks fail we
             # can log something sensible. We don't mandate an event ID here in
             # case future event formats get rid of the key.
@@ -470,9 +487,14 @@ class FederationServer(FederationBase):
                 continue
 
             try:
-                event = event_from_pdu_json(p, room_version)
+                event = event_from_pdu_json(p, room_version, received_time=request_time)
             except SynapseError as e:
                 logger.info("Ignoring PDU for failing to deserialize: %s", e)
+                continue
+            except Exception as e:
+                # We catch all exceptions here as we don't want a single bad
+                # event to cause us to fail the whole transaction.
+                logger.exception("Error deserializing PDU: %s", e)
                 continue
 
             pdus_by_room.setdefault(room_id, []).append(event)
@@ -535,7 +557,9 @@ class FederationServer(FederationBase):
         )
 
         if newest_pdu_ts and origin in self._federation_metrics_domains:
-            last_pdu_ts_metric.labels(server_name=origin).set(newest_pdu_ts / 1000)
+            last_pdu_ts_metric.labels(
+                origin_server_name=origin, **{SERVER_NAME_LABEL: self.server_name}
+            ).set(newest_pdu_ts / 1000)
 
         return pdu_results
 
@@ -543,15 +567,64 @@ class FederationServer(FederationBase):
         """Process the EDUs in a received transaction."""
 
         async def _process_edu(edu_dict: JsonDict) -> None:
-            received_edus_counter.inc()
+            received_edus_counter.labels(**{SERVER_NAME_LABEL: self.server_name}).inc()
 
             edu = Edu(
                 origin=origin,
                 destination=self.server_name,
                 edu_type=edu_dict["edu_type"],
-                content=edu_dict["content"],
+                # Make a deep-copy as we mutate the content down below
+                content=copy.deepcopy(edu_dict["content"]),
             )
+
             try:
+                # Server ACL's apply to `EduTypes.TYPING` per MSC4163:
+                #
+                # > For typing notifications (m.typing), the room_id field inside
+                # > content should be checked, with the typing notification ignored if
+                # > the origin of the request is a server which is forbidden by the
+                # > room's ACL. Ignoring the typing notification means that the EDU
+                # > MUST be dropped upon receipt.
+                if edu.edu_type == EduTypes.TYPING:
+                    origin_host, _ = parse_server_name(origin)
+                    room_id = edu.content["room_id"]
+                    try:
+                        await self.check_server_matches_acl(origin_host, room_id)
+                    except AuthError:
+                        logger.warning(
+                            "Ignoring typing EDU for room %s from banned server because of ACL's",
+                            room_id,
+                        )
+                        return
+
+                # Server ACL's apply to `EduTypes.RECEIPT` per MSC4163:
+                #
+                # > For read receipts (m.receipt), all receipts inside a room_id
+                # > inside content should be ignored if the origin of the request is
+                # > forbidden by the room's ACL.
+                if edu.edu_type == EduTypes.RECEIPT:
+                    origin_host, _ = parse_server_name(origin)
+                    to_remove_room_ids = set()
+                    for room_id in edu.content.keys():
+                        try:
+                            await self.check_server_matches_acl(origin_host, room_id)
+                        except AuthError:
+                            to_remove_room_ids.add(room_id)
+
+                    if to_remove_room_ids:
+                        logger.warning(
+                            "Ignoring receipts in EDU for rooms %s from banned server %s because of ACL's",
+                            to_remove_room_ids,
+                            origin_host,
+                        )
+
+                        for room_id in to_remove_room_ids:
+                            edu.content.pop(room_id)
+
+                        if not edu.content:
+                            # If we've removed all the rooms, we can just ignore the whole EDU
+                            return
+
                 await self.registry.on_edu(edu.edu_type, origin, edu.content)
             except Exception:
                 # If there was an error handling the EDU, we must reject the
@@ -579,7 +652,7 @@ class FederationServer(FederationBase):
 
     async def on_room_state_request(
         self, origin: str, room_id: str, event_id: str
-    ) -> Tuple[int, JsonDict]:
+    ) -> tuple[int, JsonDict]:
         await self._event_auth_handler.assert_host_in_room(room_id, origin)
         origin_host, _ = parse_server_name(origin)
         await self.check_server_matches_acl(origin_host, room_id)
@@ -590,20 +663,33 @@ class FederationServer(FederationBase):
         # - but that's non-trivial to get right, and anyway somewhat defeats
         # the point of the linearizer.
         async with self._server_linearizer.queue((origin, room_id)):
-            resp = await self._state_resp_cache.wrap(
-                (room_id, event_id),
-                self._on_context_state_request_compute,
-                room_id,
-                event_id,
-            )
-
-        return 200, resp
+            if not self._federation_callbacks.interested_in_events_delivered_over_federation():
+                # In the usual case where no module is interested in tracking event deliveries,
+                # use the response cache.
+                resp = await self._state_resp_cache.wrap(
+                    (room_id, event_id),
+                    self._on_context_state_request_compute,
+                    room_id,
+                    event_id,
+                )
+                return 200, resp
+            else:
+                # When a module is interested in tracking event deliveries,
+                # we can't use the response cache that returns pre-serialised
+                # events, as we wouldn't have the raw events to track.
+                resp, events = await self._on_context_state_request_compute_with_events(
+                    room_id, event_id
+                )
+                await self._federation_callbacks.notify_on_event_delivered_over_federation(
+                    origin, events, FederatedEventDeliveryMethod.STATE
+                )
+                return 200, resp
 
     @trace
     @tag_args
     async def on_state_ids_request(
         self, origin: str, room_id: str, event_id: str
-    ) -> Tuple[int, JsonDict]:
+    ) -> tuple[int, JsonDict]:
         if not event_id:
             raise NotImplementedError("Specify an event")
 
@@ -631,7 +717,29 @@ class FederationServer(FederationBase):
 
     async def _on_context_state_request_compute(
         self, room_id: str, event_id: str
-    ) -> Dict[str, list]:
+    ) -> dict[str, list]:
+        """
+        Respond to a `/state` request, returning just the response.
+
+        This separation exists because we don't want to hold on to the underlying
+        events in the response cache, just the serialised JSON.
+        """
+        resp, _ = await self._on_context_state_request_compute_with_events(
+            room_id, event_id
+        )
+        return resp
+
+    async def _on_context_state_request_compute_with_events(
+        self, room_id: str, event_id: str
+    ) -> tuple[dict[str, list], list[EventBase]]:
+        """
+        Respond to a `/state` request.
+
+        Returns:
+            Tuple of:
+                1. the `/state` response
+                2. list of the events used to build that response
+        """
         pdus: Collection[EventBase]
         event_ids = await self.handler.get_state_ids_for_pdu(room_id, event_id)
         pdus = await self.store.get_events_as_list(event_ids)
@@ -640,31 +748,52 @@ class FederationServer(FederationBase):
             room_id, [pdu.event_id for pdu in pdus]
         )
 
-        return {
-            "pdus": serialize_and_filter_pdus(pdus),
-            "auth_chain": serialize_and_filter_pdus(auth_chain),
-        }
+        return (
+            {
+                "pdus": serialize_and_filter_pdus(pdus),
+                "auth_chain": serialize_and_filter_pdus(auth_chain),
+            },
+            [*pdus, *auth_chain],
+        )
 
     async def on_pdu_request(
         self, origin: str, event_id: str
-    ) -> Tuple[int, Union[JsonDict, str]]:
+    ) -> tuple[int, JsonDict | str]:
         pdu = await self.handler.get_persisted_pdu(origin, event_id)
 
         if pdu:
+            await self._federation_callbacks.notify_on_event_delivered_over_federation(
+                origin, [pdu], FederatedEventDeliveryMethod.EVENT
+            )
             return 200, self._transaction_dict_from_pdus([pdu])
         else:
             return 404, ""
 
     async def on_query_request(
-        self, query_type: str, args: Dict[str, str]
-    ) -> Tuple[int, Dict[str, Any]]:
-        received_queries_counter.labels(query_type).inc()
+        self, query_type: str, args: dict[str, str]
+    ) -> tuple[int, dict[str, Any]]:
+        received_queries_counter.labels(
+            type=query_type,
+            **{SERVER_NAME_LABEL: self.server_name},
+        ).inc()
         resp = await self.registry.on_query(query_type, args)
         return 200, resp
 
+    async def on_get_extremities_request(self, origin: str, room_id: str) -> JsonDict:
+        # Assert host in room first to hide contents of the ACL from the caller
+        await self._event_auth_handler.assert_host_in_room(room_id, origin)
+        origin_host, _ = parse_server_name(origin)
+        await self.check_server_matches_acl(origin_host, room_id)
+
+        extremities = await self.store.get_forward_extremities_for_room(room_id)
+        prev_event_ids = [event_id for event_id, _, _, _ in extremities]
+        if len(prev_event_ids) == 0:
+            raise SynapseError(500, "Room has no forward extremities")
+        return {"prev_events": prev_event_ids}
+
     async def on_make_join_request(
-        self, origin: str, room_id: str, user_id: str, supported_versions: List[str]
-    ) -> Dict[str, Any]:
+        self, origin: str, room_id: str, user_id: str, supported_versions: list[str]
+    ) -> dict[str, Any]:
         origin_host, _ = parse_server_name(origin)
         await self.check_server_matches_acl(origin_host, room_id)
 
@@ -689,7 +818,7 @@ class FederationServer(FederationBase):
 
     async def on_invite_request(
         self, origin: str, content: JsonDict, room_version_id: str
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         room_version = KNOWN_ROOM_VERSIONS.get(room_version_id)
         if not room_version:
             raise SynapseError(
@@ -723,7 +852,7 @@ class FederationServer(FederationBase):
         content: JsonDict,
         room_id: str,
         caller_supports_partial_state: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         set_tag(
             SynapseTags.SEND_JOIN_RESPONSE_IS_PARTIAL_STATE,
             caller_supports_partial_state,
@@ -738,10 +867,24 @@ class FederationServer(FederationBase):
             origin, content, Membership.JOIN, room_id
         )
 
+        if supports_msc4242_state_dag(event):
+            # FIXME: We don't yet support faster room joins in Synapse with MSC4242
+            caller_supports_partial_state = False
+
+        # Use the join event's own stream ordering as the upper bound when fetching
+        # forward extremities (below), so we only consider extremities that existed at
+        # or before the join rather than those introduced by concurrent writes that
+        # occur while we prepare the response.
+        # Note: in workers mode the event is persisted on a separate worker, so
+        # event.internal_metadata.stream_ordering is not populated here; query the DB.
+        stream_ordering_of_join = (
+            await self.store.get_position_for_event(event.event_id)
+        ).stream
+
         prev_state_ids = await context.get_prev_state_ids()
 
         state_event_ids: Collection[str]
-        servers_in_room: Optional[Collection[str]]
+        servers_in_room: Collection[str] | None
         if caller_supports_partial_state:
             summary = await self.store.get_room_summary(room_id)
             state_event_ids = _get_event_ids_for_partial_state_join(
@@ -754,37 +897,82 @@ class FederationServer(FederationBase):
             state_event_ids = prev_state_ids.values()
             servers_in_room = None
 
-        auth_chain_event_ids = await self.store.get_auth_chain_ids(
-            room_id, state_event_ids
-        )
+        state_dag: Sequence[EventBase] = ()
+        state_events: Sequence[EventBase] = ()
+        auth_chain_events: Sequence[EventBase] = ()
 
-        # if the caller has opted in, we can omit any auth_chain events which are
-        # already in state_event_ids
-        if caller_supports_partial_state:
-            auth_chain_event_ids.difference_update(state_event_ids)
+        if supports_msc4242_state_dag(event):
+            state_dag_map = await self.store.get_state_dag(
+                room_id, set(event.prev_state_events)
+            )
+            state_dag = list(state_dag_map.values())
+        else:
+            auth_chain_event_ids = await self.store.get_auth_chain_ids(
+                room_id, state_event_ids
+            )
 
-        auth_chain_events = await self.store.get_events_as_list(auth_chain_event_ids)
-        state_events = await self.store.get_events_as_list(state_event_ids)
+            # if the caller has opted in, we can omit any auth_chain events which are
+            # already in state_event_ids
+            if caller_supports_partial_state:
+                auth_chain_event_ids.difference_update(state_event_ids)
+
+            auth_chain_events = await self.store.get_events_as_list(
+                auth_chain_event_ids
+            )
+            state_events = await self.store.get_events_as_list(state_event_ids)
 
         # we try to do all the async stuff before this point, so that time_now is as
         # accurate as possible.
         time_now = self._clock.time_msec()
         event_json = event.get_pdu_json(time_now)
-        resp = {
+        resp: JsonDict = {
             "event": event_json,
-            "state": serialize_and_filter_pdus(state_events, time_now),
-            "auth_chain": serialize_and_filter_pdus(auth_chain_events, time_now),
             "members_omitted": caller_supports_partial_state,
         }
+        if supports_msc4242_state_dag(event):
+            resp["state_dag"] = serialize_and_filter_pdus(state_dag, time_now)
+        else:
+            resp["state"] = serialize_and_filter_pdus(state_events, time_now)
+            resp["auth_chain"] = serialize_and_filter_pdus(auth_chain_events, time_now)
+
+        # Check the forward extremities for the room here. If there is more than one, it
+        # is likely that another event was created in the room during the
+        # make_join/send_join handshake. The joining server is likely to thus miss this event
+        # until a second event is created that references it - which could be some time.
+        # In that case, we proactively send a dummy extensible event that ties these
+        # forward extremities together. The remote server will then attempt to backfill
+        # the missing event on its own.
+        #
+        # By not sending the 'missing event' directly, but instead having the joining
+        # homeserver backfill it, the stream ordering for the missing event will be
+        # "before" the join (which is what we expect).
+
+        forward_extremities = (
+            await self.store.get_forward_extremities_for_room_at_stream_ordering(
+                room_id, stream_ordering_of_join
+            )
+        )
+
+        if len(forward_extremities) > 1:
+            # The likelihood of this being used is extremely low, thus only build the handler
+            # when necessary.
+            _creation_handler = self.hs.get_event_creation_handler()
+            await _creation_handler._send_dummy_event_after_room_join(room_id)
 
         if servers_in_room is not None:
             resp["servers_in_room"] = list(servers_in_room)
+
+        await self._federation_callbacks.notify_on_event_delivered_over_federation(
+            origin,
+            [event, *state_dag, *state_events, *auth_chain_events],
+            FederatedEventDeliveryMethod.SEND_JOIN,
+        )
 
         return resp
 
     async def on_make_leave_request(
         self, origin: str, room_id: str, user_id: str
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         origin_host, _ = parse_server_name(origin)
         await self.check_server_matches_acl(origin_host, room_id)
         pdu = await self.handler.on_make_leave_request(origin, room_id, user_id)
@@ -801,7 +989,7 @@ class FederationServer(FederationBase):
         return {}
 
     async def on_make_knock_request(
-        self, origin: str, room_id: str, user_id: str, supported_versions: List[str]
+        self, origin: str, room_id: str, user_id: str, supported_versions: list[str]
     ) -> JsonDict:
         """We've received a /make_knock/ request, so we create a partial knock
         event for the room and hand that back, along with the room version, to the knocking
@@ -859,7 +1047,7 @@ class FederationServer(FederationBase):
         origin: str,
         content: JsonDict,
         room_id: str,
-    ) -> Dict[str, List[JsonDict]]:
+    ) -> dict[str, list[JsonDict]]:
         """
         We have received a knock event for a room. Verify and send the event into the room
         on the knocking homeserver's behalf. Then reply with some stripped state from the
@@ -889,7 +1077,7 @@ class FederationServer(FederationBase):
 
     async def _on_send_membership_event(
         self, origin: str, content: JsonDict, membership_type: str, room_id: str
-    ) -> Tuple[EventBase, EventContext]:
+    ) -> EventPersistencePair:
         """Handle an on_send_{join,leave,knock} request
 
         Does some preliminary validation before passing the request on to the
@@ -928,7 +1116,8 @@ class FederationServer(FederationBase):
             # joins) or the full state (for full joins).
             # Return a 404 as we would if we weren't in the room at all.
             logger.info(
-                f"Rejecting /send_{membership_type} to %s because it's a partial state room",
+                "Rejecting /send_%s to %s because it's a partial state room",
+                membership_type,
                 room_id,
             )
             raise SynapseError(
@@ -1008,32 +1197,36 @@ class FederationServer(FederationBase):
 
     async def on_event_auth(
         self, origin: str, room_id: str, event_id: str
-    ) -> Tuple[int, Dict[str, Any]]:
+    ) -> tuple[int, dict[str, Any]]:
         async with self._server_linearizer.queue((origin, room_id)):
             await self._event_auth_handler.assert_host_in_room(room_id, origin)
             origin_host, _ = parse_server_name(origin)
             await self.check_server_matches_acl(origin_host, room_id)
 
             time_now = self._clock.time_msec()
-            auth_pdus = await self.handler.on_event_auth(event_id)
+            auth_pdus = await self.handler.on_event_auth(event_id, room_id)
             res = {"auth_chain": serialize_and_filter_pdus(auth_pdus, time_now)}
+
+            await self._federation_callbacks.notify_on_event_delivered_over_federation(
+                origin, auth_pdus, FederatedEventDeliveryMethod.EVENT_AUTH
+            )
         return 200, res
 
     async def on_query_client_keys(
-        self, origin: str, content: Dict[str, str]
-    ) -> Tuple[int, Dict[str, Any]]:
+        self, origin: str, content: dict[str, str]
+    ) -> tuple[int, dict[str, Any]]:
         return await self.on_query_request("client_keys", content)
 
     async def on_query_user_devices(
         self, origin: str, user_id: str
-    ) -> Tuple[int, Dict[str, Any]]:
+    ) -> tuple[int, dict[str, Any]]:
         keys = await self.device_handler.on_federation_query_user_devices(user_id)
         return 200, keys
 
     @trace
     async def on_claim_client_keys(
-        self, query: List[Tuple[str, str, str, int]], always_include_fallback_keys: bool
-    ) -> Dict[str, Any]:
+        self, query: list[tuple[str, str, str, int]], always_include_fallback_keys: bool
+    ) -> dict[str, Any]:
         if any(
             not self.hs.is_mine(UserID.from_string(user_id))
             for user_id, _, _, _ in query
@@ -1045,7 +1238,7 @@ class FederationServer(FederationBase):
             query, always_include_fallback_keys=always_include_fallback_keys
         )
 
-        json_result: Dict[str, Dict[str, Dict[str, JsonDict]]] = {}
+        json_result: dict[str, dict[str, dict[str, JsonDict]]] = {}
         for result in results:
             for user_id, device_keys in result.items():
                 for device_id, keys in device_keys.items():
@@ -1072,10 +1265,11 @@ class FederationServer(FederationBase):
         self,
         origin: str,
         room_id: str,
-        earliest_events: List[str],
-        latest_events: List[str],
+        earliest_events: list[str],
+        latest_events: list[str],
         limit: int,
-    ) -> Dict[str, list]:
+        walk_state_dag: bool = False,
+    ) -> dict[str, list]:
         async with self._server_linearizer.queue((origin, room_id)):
             origin_host, _ = parse_server_name(origin)
             await self.check_server_matches_acl(origin_host, room_id)
@@ -1088,9 +1282,14 @@ class FederationServer(FederationBase):
                 limit,
             )
 
-            missing_events = await self.handler.on_get_missing_events(
-                origin, room_id, earliest_events, latest_events, limit
-            )
+            if walk_state_dag:
+                missing_events = await self.handler.on_get_missing_events_state_dag(
+                    origin, room_id, earliest_events, latest_events, limit
+                )
+            else:
+                missing_events = await self.handler.on_get_missing_events(
+                    origin, room_id, earliest_events, latest_events, limit
+                )
 
             if len(missing_events) < 5:
                 logger.debug(
@@ -1099,15 +1298,19 @@ class FederationServer(FederationBase):
             else:
                 logger.debug("Returning %d events", len(missing_events))
 
+            await self._federation_callbacks.notify_on_event_delivered_over_federation(
+                origin, missing_events, FederatedEventDeliveryMethod.GET_MISSING_EVENTS
+            )
+
             time_now = self._clock.time_msec()
 
         return {"events": serialize_and_filter_pdus(missing_events, time_now)}
 
-    async def on_openid_userinfo(self, token: str) -> Optional[str]:
+    async def on_openid_userinfo(self, token: str) -> str | None:
         ts_now_ms = self._clock.time_msec()
         return await self.store.get_user_id_for_open_id_token(token, ts_now_ms)
 
-    def _transaction_dict_from_pdus(self, pdu_list: List[EventBase]) -> JsonDict:
+    def _transaction_dict_from_pdus(self, pdu_list: list[EventBase]) -> JsonDict:
         """Returns a new Transaction containing the given PDUs suitable for
         transmission.
         """
@@ -1182,7 +1385,7 @@ class FederationServer(FederationBase):
 
     async def _get_next_nonspam_staged_event_for_room(
         self, room_id: str, room_version: RoomVersion
-    ) -> Optional[Tuple[str, EventBase]]:
+    ) -> tuple[str, EventBase] | None:
         """Fetch the first non-spam event from staging queue.
 
         Args:
@@ -1223,8 +1426,8 @@ class FederationServer(FederationBase):
         room_id: str,
         room_version: RoomVersion,
         lock: Lock,
-        latest_origin: Optional[str] = None,
-        latest_event: Optional[EventBase] = None,
+        latest_origin: str | None = None,
+        latest_event: EventBase | None = None,
     ) -> None:
         """Process events in the staging area for the given room.
 
@@ -1299,9 +1502,9 @@ class FederationServer(FederationBase):
                     origin, event.event_id
                 )
                 if received_ts is not None:
-                    pdu_process_time.observe(
-                        (self._clock.time_msec() - received_ts) / 1000
-                    )
+                    pdu_process_time.labels(
+                        **{SERVER_NAME_LABEL: self.server_name}
+                    ).observe((self._clock.time_msec() - received_ts) / 1000)
 
             next = await self._get_next_nonspam_staged_event_for_room(
                 room_id, room_version
@@ -1337,13 +1540,13 @@ class FederationServer(FederationBase):
             lock = new_lock
 
     async def exchange_third_party_invite(
-        self, sender_user_id: str, target_user_id: str, room_id: str, signed: Dict
+        self, sender_user_id: str, target_user_id: str, room_id: str, signed: dict
     ) -> None:
         await self.handler.exchange_third_party_invite(
             sender_user_id, target_user_id, room_id, signed
         )
 
-    async def on_exchange_third_party_invite_request(self, event_dict: Dict) -> None:
+    async def on_exchange_third_party_invite_request(self, event_dict: dict) -> None:
         await self.handler.on_exchange_third_party_invite_request(event_dict)
 
     async def check_server_matches_acl(self, server_name: str, room_id: str) -> None:
@@ -1379,16 +1582,15 @@ class FederationHandlerRegistry:
         # and use them. However we have guards before we use them to ensure that
         # we don't route to ourselves, and in monolith mode that will always be
         # the case.
-        self._get_query_client = ReplicationGetQueryRestServlet.make_client(hs)
         self._send_edu = ReplicationFederationSendEduRestServlet.make_client(hs)
 
-        self.edu_handlers: Dict[str, Callable[[str, dict], Awaitable[None]]] = {}
-        self.query_handlers: Dict[str, Callable[[dict], Awaitable[JsonDict]]] = {}
+        self.edu_handlers: dict[str, Callable[[str, dict], Awaitable[None]]] = {}
+        self.query_handlers: dict[str, Callable[[dict], Awaitable[JsonDict]]] = {}
 
         # Map from type to instance names that we should route EDU handling to.
         # We randomly choose one instance from the list to route to for each new
         # EDU received.
-        self._edu_type_to_instance: Dict[str, List[str]] = {}
+        self._edu_type_to_instance: dict[str, list[str]] = {}
 
     def register_edu_handler(
         self, edu_type: str, handler: Callable[[str, JsonDict], Awaitable[None]]
@@ -1430,7 +1632,7 @@ class FederationHandlerRegistry:
         self.query_handlers[query_type] = handler
 
     def register_instances_for_edu(
-        self, edu_type: str, instance_names: List[str]
+        self, edu_type: str, instance_names: list[str]
     ) -> None:
         """Register that the EDU handler is on multiple instances."""
         self._edu_type_to_instance[edu_type] = instance_names
@@ -1467,10 +1669,6 @@ class FederationHandlerRegistry:
         handler = self.query_handlers.get(query_type)
         if handler:
             return await handler(args)
-
-        # Check if we can route it somewhere else that isn't us
-        if self._instance_name == "master":
-            return await self._get_query_client(query_type=query_type, args=args)
 
         # Uh oh, no handler! Let's raise an exception so the request returns an
         # error.

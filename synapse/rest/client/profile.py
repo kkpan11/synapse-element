@@ -23,7 +23,7 @@
 
 import re
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING
 
 from synapse.api.constants import ProfileFields
 from synapse.api.errors import Codes, SynapseError
@@ -36,7 +36,7 @@ from synapse.http.servlet import (
 )
 from synapse.http.site import SynapseRequest
 from synapse.rest.client._base import client_patterns
-from synapse.types import JsonDict, JsonValue, UserID
+from synapse.types import JsonDict, UserID
 from synapse.util.stringutils import is_namedspaced_grammar
 
 if TYPE_CHECKING:
@@ -57,163 +57,8 @@ def _read_propagate(hs: "HomeServer", request: SynapseRequest) -> bool:
     return propagate
 
 
-class ProfileDisplaynameRestServlet(RestServlet):
-    PATTERNS = client_patterns("/profile/(?P<user_id>[^/]*)/displayname", v1=True)
-    CATEGORY = "Event sending requests"
-
-    def __init__(self, hs: "HomeServer"):
-        super().__init__()
-        self.hs = hs
-        self.profile_handler = hs.get_profile_handler()
-        self.auth = hs.get_auth()
-
-    async def on_GET(
-        self, request: SynapseRequest, user_id: str
-    ) -> Tuple[int, JsonDict]:
-        requester_user = None
-
-        if self.hs.config.server.require_auth_for_profile_requests:
-            requester = await self.auth.get_user_by_req(request)
-            requester_user = requester.user
-
-        if not UserID.is_valid(user_id):
-            raise SynapseError(
-                HTTPStatus.BAD_REQUEST, "Invalid user id", Codes.INVALID_PARAM
-            )
-
-        user = UserID.from_string(user_id)
-        await self.profile_handler.check_profile_query_allowed(user, requester_user)
-
-        displayname = await self.profile_handler.get_displayname(user)
-
-        ret = {}
-        if displayname is not None:
-            ret["displayname"] = displayname
-
-        return 200, ret
-
-    async def on_PUT(
-        self, request: SynapseRequest, user_id: str
-    ) -> Tuple[int, JsonDict]:
-        if not UserID.is_valid(user_id):
-            raise SynapseError(
-                HTTPStatus.BAD_REQUEST, "Invalid user id", Codes.INVALID_PARAM
-            )
-
-        requester = await self.auth.get_user_by_req(request, allow_guest=True)
-        user = UserID.from_string(user_id)
-        is_admin = await self.auth.is_server_admin(requester)
-
-        content = parse_json_object_from_request(request)
-
-        try:
-            new_name = content["displayname"]
-        except Exception:
-            raise SynapseError(
-                400, "Missing key 'displayname'", errcode=Codes.MISSING_PARAM
-            )
-
-        propagate = _read_propagate(self.hs, request)
-
-        requester_suspended = (
-            await self.hs.get_datastores().main.get_user_suspended_status(
-                requester.user.to_string()
-            )
-        )
-
-        if requester_suspended:
-            raise SynapseError(
-                403,
-                "Updating displayname while account is suspended is not allowed.",
-                Codes.USER_ACCOUNT_SUSPENDED,
-            )
-
-        await self.profile_handler.set_displayname(
-            user, requester, new_name, is_admin, propagate=propagate
-        )
-
-        return 200, {}
-
-
-class ProfileAvatarURLRestServlet(RestServlet):
-    PATTERNS = client_patterns("/profile/(?P<user_id>[^/]*)/avatar_url", v1=True)
-    CATEGORY = "Event sending requests"
-
-    def __init__(self, hs: "HomeServer"):
-        super().__init__()
-        self.hs = hs
-        self.profile_handler = hs.get_profile_handler()
-        self.auth = hs.get_auth()
-
-    async def on_GET(
-        self, request: SynapseRequest, user_id: str
-    ) -> Tuple[int, JsonDict]:
-        requester_user = None
-
-        if self.hs.config.server.require_auth_for_profile_requests:
-            requester = await self.auth.get_user_by_req(request)
-            requester_user = requester.user
-
-        if not UserID.is_valid(user_id):
-            raise SynapseError(
-                HTTPStatus.BAD_REQUEST, "Invalid user id", Codes.INVALID_PARAM
-            )
-
-        user = UserID.from_string(user_id)
-        await self.profile_handler.check_profile_query_allowed(user, requester_user)
-
-        avatar_url = await self.profile_handler.get_avatar_url(user)
-
-        ret = {}
-        if avatar_url is not None:
-            ret["avatar_url"] = avatar_url
-
-        return 200, ret
-
-    async def on_PUT(
-        self, request: SynapseRequest, user_id: str
-    ) -> Tuple[int, JsonDict]:
-        if not UserID.is_valid(user_id):
-            raise SynapseError(
-                HTTPStatus.BAD_REQUEST, "Invalid user id", Codes.INVALID_PARAM
-            )
-
-        requester = await self.auth.get_user_by_req(request)
-        user = UserID.from_string(user_id)
-        is_admin = await self.auth.is_server_admin(requester)
-
-        content = parse_json_object_from_request(request)
-        try:
-            new_avatar_url = content["avatar_url"]
-        except KeyError:
-            raise SynapseError(
-                400, "Missing key 'avatar_url'", errcode=Codes.MISSING_PARAM
-            )
-
-        propagate = _read_propagate(self.hs, request)
-
-        requester_suspended = (
-            await self.hs.get_datastores().main.get_user_suspended_status(
-                requester.user.to_string()
-            )
-        )
-
-        if requester_suspended:
-            raise SynapseError(
-                403,
-                "Updating avatar URL while account is suspended is not allowed.",
-                Codes.USER_ACCOUNT_SUSPENDED,
-            )
-
-        await self.profile_handler.set_avatar_url(
-            user, requester, new_avatar_url, is_admin, propagate=propagate
-        )
-
-        return 200, {}
-
-
 class ProfileRestServlet(RestServlet):
-    PATTERNS = client_patterns("/profile/(?P<user_id>[^/]*)", v1=True)
+    PATTERNS = client_patterns("/profile/(?P<user_id>[^/]*)$", v1=True)
     CATEGORY = "Event sending requests"
 
     def __init__(self, hs: "HomeServer"):
@@ -224,7 +69,7 @@ class ProfileRestServlet(RestServlet):
 
     async def on_GET(
         self, request: SynapseRequest, user_id: str
-    ) -> Tuple[int, JsonDict]:
+    ) -> tuple[int, JsonDict]:
         requester_user = None
 
         if self.hs.config.server.require_auth_for_profile_requests:
@@ -244,12 +89,19 @@ class ProfileRestServlet(RestServlet):
         return 200, ret
 
 
-class UnstableProfileFieldRestServlet(RestServlet):
+class ProfileFieldRestServlet(RestServlet):
     PATTERNS = [
+        *client_patterns(
+            "/profile/(?P<user_id>[^/]*)/(?P<field_name>displayname)$", v1=True
+        ),
+        *client_patterns(
+            "/profile/(?P<user_id>[^/]*)/(?P<field_name>avatar_url)$", v1=True
+        ),
         re.compile(
-            r"^/_matrix/client/unstable/uk\.tcpip\.msc4133/profile/(?P<user_id>[^/]*)/(?P<field_name>[^/]*)"
-        )
+            r"^/_matrix/client/v3/profile/(?P<user_id>[^/]*)/(?P<field_name>[^/]*)$",
+        ),
     ]
+
     CATEGORY = "Event sending requests"
 
     def __init__(self, hs: "HomeServer"):
@@ -257,10 +109,16 @@ class UnstableProfileFieldRestServlet(RestServlet):
         self.hs = hs
         self.profile_handler = hs.get_profile_handler()
         self.auth = hs.get_auth()
+        if hs.config.experimental.msc4133_enabled:
+            self.PATTERNS.append(
+                re.compile(
+                    r"^/_matrix/client/unstable/uk\.tcpip\.msc4133/profile/(?P<user_id>[^/]*)/(?P<field_name>[^/]*)$"
+                )
+            )
 
     async def on_GET(
         self, request: SynapseRequest, user_id: str, field_name: str
-    ) -> Tuple[int, JsonDict]:
+    ) -> tuple[int, JsonDict]:
         requester_user = None
 
         if self.hs.config.server.require_auth_for_profile_requests:
@@ -287,24 +145,40 @@ class UnstableProfileFieldRestServlet(RestServlet):
         user = UserID.from_string(user_id)
         await self.profile_handler.check_profile_query_allowed(user, requester_user)
 
+        ret: JsonDict = {}
         if field_name == ProfileFields.DISPLAYNAME:
-            field_value: JsonValue = await self.profile_handler.get_displayname(user)
+            displayname = await self.profile_handler.get_displayname(user)
+            if displayname is not None:
+                ret[field_name] = displayname
         elif field_name == ProfileFields.AVATAR_URL:
-            field_value = await self.profile_handler.get_avatar_url(user)
+            avatar_url = await self.profile_handler.get_avatar_url(user)
+            if avatar_url is not None:
+                ret[field_name] = avatar_url
         else:
-            field_value = await self.profile_handler.get_profile_field(user, field_name)
+            # Custom fields deliberately behave differently from `displayname` and
+            # `avatar_url`: an unset custom field raises a 404 rather than returning
+            # `200 {}`. The spec allows both, see MSC4537:
+            # https://github.com/matrix-org/matrix-spec-proposals/pull/4537
+            # This is likely to change once the spec settles on either 404 or
+            # `200 {}` only, which would be a breaking change.
+            ret[field_name] = await self.profile_handler.get_profile_field(
+                user, field_name
+            )
 
-        return 200, {field_name: field_value}
+        return 200, ret
 
     async def on_PUT(
         self, request: SynapseRequest, user_id: str, field_name: str
-    ) -> Tuple[int, JsonDict]:
+    ) -> tuple[int, JsonDict]:
         if not UserID.is_valid(user_id):
             raise SynapseError(
                 HTTPStatus.BAD_REQUEST, "Invalid user id", Codes.INVALID_PARAM
             )
 
-        requester = await self.auth.get_user_by_req(request)
+        # Guest users are able to set their own displayname.
+        requester = await self.auth.get_user_by_req(
+            request, allow_guest=field_name == ProfileFields.DISPLAYNAME
+        )
         user = UserID.from_string(user_id)
         is_admin = await self.auth.is_server_admin(requester)
 
@@ -343,30 +217,29 @@ class UnstableProfileFieldRestServlet(RestServlet):
                 Codes.USER_ACCOUNT_SUSPENDED,
             )
 
-        if field_name == ProfileFields.DISPLAYNAME:
-            await self.profile_handler.set_displayname(
-                user, requester, new_value, is_admin, propagate=propagate
-            )
-        elif field_name == ProfileFields.AVATAR_URL:
-            await self.profile_handler.set_avatar_url(
-                user, requester, new_value, is_admin, propagate=propagate
-            )
-        else:
-            await self.profile_handler.set_profile_field(
-                user, requester, field_name, new_value, is_admin
-            )
+        await self.profile_handler.dispatch_set_profile_field(
+            target_user=user,
+            requester=requester,
+            field_name=field_name,
+            new_value=new_value,
+            by_admin=is_admin,
+            propagate=propagate,
+        )
 
         return 200, {}
 
     async def on_DELETE(
         self, request: SynapseRequest, user_id: str, field_name: str
-    ) -> Tuple[int, JsonDict]:
+    ) -> tuple[int, JsonDict]:
         if not UserID.is_valid(user_id):
             raise SynapseError(
                 HTTPStatus.BAD_REQUEST, "Invalid user id", Codes.INVALID_PARAM
             )
 
-        requester = await self.auth.get_user_by_req(request)
+        # Guest users are able to set their own displayname.
+        requester = await self.auth.get_user_by_req(
+            request, allow_guest=field_name == ProfileFields.DISPLAYNAME
+        )
         user = UserID.from_string(user_id)
         is_admin = await self.auth.is_server_admin(requester)
 
@@ -397,27 +270,36 @@ class UnstableProfileFieldRestServlet(RestServlet):
                 Codes.USER_ACCOUNT_SUSPENDED,
             )
 
-        if field_name == ProfileFields.DISPLAYNAME:
-            await self.profile_handler.set_displayname(
-                user, requester, "", is_admin, propagate=propagate
-            )
-        elif field_name == ProfileFields.AVATAR_URL:
-            await self.profile_handler.set_avatar_url(
-                user, requester, "", is_admin, propagate=propagate
+        if field_name in (ProfileFields.DISPLAYNAME, ProfileFields.AVATAR_URL):
+            await self.profile_handler.dispatch_set_profile_field(
+                target_user=user,
+                requester=requester,
+                field_name=field_name,
+                new_value="",
+                by_admin=is_admin,
+                propagate=propagate,
             )
         else:
-            await self.profile_handler.delete_profile_field(
-                user, requester, field_name, is_admin
+            await self.profile_handler.dispatch_delete_profile_field(
+                target_user=user,
+                requester=requester,
+                field_name=field_name,
+                by_admin=is_admin,
             )
 
         return 200, {}
 
 
+class UnstableProfileFieldRestServlet(ProfileFieldRestServlet):
+    re.compile(
+        r"^/_matrix/client/unstable/uk\.tcpip\.msc4133/profile/(?P<user_id>[^/]*)/(?P<field_name>[^/]*)"
+    )
+
+
 def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
-    # The specific displayname / avatar URL / custom field endpoints *must* appear
-    # before their corresponding generic profile endpoint.
-    ProfileDisplaynameRestServlet(hs).register(http_server)
-    ProfileAvatarURLRestServlet(hs).register(http_server)
-    ProfileRestServlet(hs).register(http_server)
+    ProfileFieldRestServlet(hs).register(http_server)
+
     if hs.config.experimental.msc4133_enabled:
         UnstableProfileFieldRestServlet(hs).register(http_server)
+
+    ProfileRestServlet(hs).register(http_server)

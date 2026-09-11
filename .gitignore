@@ -35,6 +35,7 @@ __pycache__/
 /media_store/
 /uploads
 /homeserver-config-overrides.d
+tmp/
 
 # For direnv users
 /.envrc
@@ -47,11 +48,13 @@ __pycache__/
 /.idea/
 /.ropeproject/
 /.vscode/
+/.zed/
 
 # build products
 !/.coveragerc
 /.coverage*
 /.mypy_cache/
+/.ruff_cache/
 /.tox
 /.tox-pg-container
 /build/

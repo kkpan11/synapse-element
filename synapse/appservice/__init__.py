@@ -23,15 +23,30 @@
 import logging
 import re
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Pattern, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Iterable,
+    Pattern,
+    Sequence,
+    cast,
+)
 
 import attr
 from netaddr import IPSet
 
+from twisted.internet import reactor
+
 from synapse.api.constants import EventTypes
 from synapse.events import EventBase
-from synapse.types import DeviceListUpdates, JsonDict, JsonMapping, UserID
+from synapse.types import (
+    DeviceListUpdates,
+    ISynapseThreadlessReactor,
+    JsonDict,
+    JsonMapping,
+    UserID,
+)
 from synapse.util.caches.descriptors import _CacheContext, cached
+from synapse.util.clock import Clock
 
 if TYPE_CHECKING:
     from synapse.appservice.api import ApplicationServiceApi
@@ -41,11 +56,19 @@ logger = logging.getLogger(__name__)
 
 # Type for the `device_one_time_keys_count` field in an appservice transaction
 #   user ID -> {device ID -> {algorithm -> count}}
-TransactionOneTimeKeysCount = Dict[str, Dict[str, Dict[str, int]]]
+TransactionOneTimeKeysCount = dict[str, dict[str, dict[str, int]]]
 
 # Type for the `device_unused_fallback_key_types` field in an appservice transaction
 #   user ID -> {device ID -> [algorithm]}
-TransactionUnusedFallbackKeys = Dict[str, Dict[str, List[str]]]
+TransactionUnusedFallbackKeys = dict[str, dict[str, list[str]]]
+
+
+class Scopes(str, Enum):
+    """
+    All known scopes assignable to application services for extended privileges.
+    """
+
+    QUERY_ROOM_MEMBERSHIP = "urn:matrix:client:io.element.msc4502:rooms:is_joined"
 
 
 class ApplicationServiceState(Enum):
@@ -74,31 +97,58 @@ class ApplicationService:
     # values.
     NS_LIST = [NS_USERS, NS_ALIASES, NS_ROOMS]
 
+    # Prefixes are applied after the version segment(s) (either /vX/ or /unstable/foo/):
+    # - /_matrix/client/(unstable/[^/]+|v[^/]+)/{prefix}/.*
+    # - /_matrix/federation/(unstable/[^/]+|v[^/]+)/{prefix}/.*
+    ALLOWED_PROXY_PREFIXES = {"rtc/livekit"}
+
     def __init__(
         self,
         token: str,
         id: str,
-        sender: str,
-        url: Optional[str] = None,
-        namespaces: Optional[JsonDict] = None,
-        hs_token: Optional[str] = None,
-        protocols: Optional[Iterable[str]] = None,
+        sender: UserID,
+        url: str | None = None,
+        namespaces: JsonDict | None = None,
+        hs_token: str | None = None,
+        protocols: Iterable[str] | None = None,
         rate_limited: bool = True,
-        ip_range_whitelist: Optional[IPSet] = None,
+        ip_range_whitelist: IPSet | None = None,
         supports_ephemeral: bool = False,
+        supports_unstable_ephemeral: bool = False,
         msc3202_transaction_extensions: bool = False,
         msc4190_device_management: bool = False,
+        scopes: Iterable[str] = frozenset(),
+        proxy_prefix: str | None = None,
+        proxy_url: str | None = None,
     ):
         self.token = token
         self.url = (
             url.rstrip("/") if isinstance(url, str) else None
         )  # url must not end with a slash
+        self.proxy_url = (
+            proxy_url.rstrip("/") if isinstance(proxy_url, str) else None
+        )  # proxy_url must not end with a slash
+        self.proxy_prefix = (
+            proxy_prefix.rstrip("/") if isinstance(proxy_prefix, str) else None
+        )  # proxy_prefix must not end with a slash
         self.hs_token = hs_token
         # The full Matrix ID for this application service's sender.
         self.sender = sender
+        # The application service user should be part of the server's domain.
+        self.server_name = sender.domain  # nb must be called this for @cached
+
+        # Ideally we would require passing in the `HomeServer` `Clock` instance.
+        # However this is not currently possible as there are places which use
+        # `@cached` that aren't aware of the `HomeServer` instance.
+        # nb must be called this for @cached
+        self.clock = Clock(
+            cast(ISynapseThreadlessReactor, reactor), server_name=self.server_name
+        )  # type: ignore[multiple-internal-clocks]
+
         self.namespaces = self._check_namespaces(namespaces)
         self.id = id
         self.ip_range_whitelist = ip_range_whitelist
+        self.supports_unstable_ephemeral = supports_unstable_ephemeral
         self.supports_ephemeral = supports_ephemeral
         self.msc3202_transaction_extensions = msc3202_transaction_extensions
         self.msc4190_device_management = msc4190_device_management
@@ -106,17 +156,30 @@ class ApplicationService:
         if "|" in self.id:
             raise Exception("application service ID cannot contain '|' character")
 
+        if (self.proxy_prefix is None) != (self.proxy_url is None):
+            raise KeyError("proxy_url and proxy_prefix must always be set together")
+        if proxy_prefix is not None:
+            if not proxy_prefix or not self.proxy_url:
+                raise ValueError("proxy_prefix and proxy_url must be non-empty strings")
+            if not self._is_proxy_prefix_allowed(proxy_prefix):
+                raise ValueError(f"cannot claim reserved proxy prefix {proxy_prefix!r}")
+
         # .protocols is a publicly visible field
         if protocols:
             self.protocols = set(protocols)
         else:
             self.protocols = set()
 
+        self.scopes = set(scopes)
+        unknown_scopes = self.scopes - frozenset(Scopes)
+        if unknown_scopes:
+            raise ValueError(f"Unknown application service scope(s): {unknown_scopes}")
+
         self.rate_limited = rate_limited
 
     def _check_namespaces(
-        self, namespaces: Optional[JsonDict]
-    ) -> Dict[str, List[Namespace]]:
+        self, namespaces: JsonDict | None
+    ) -> dict[str, list[Namespace]]:
         # Sanity check that it is of the form:
         # {
         #   users: [ {regex: "[A-z]+.*", exclusive: true}, ...],
@@ -126,7 +189,7 @@ class ApplicationService:
         if namespaces is None:
             namespaces = {}
 
-        result: Dict[str, List[Namespace]] = {}
+        result: dict[str, list[Namespace]] = {}
 
         for ns in ApplicationService.NS_LIST:
             result[ns] = []
@@ -152,9 +215,7 @@ class ApplicationService:
 
         return result
 
-    def _matches_regex(
-        self, namespace_key: str, test_string: str
-    ) -> Optional[Namespace]:
+    def _matches_regex(self, namespace_key: str, test_string: str) -> Namespace | None:
         for namespace in self.namespaces[namespace_key]:
             if namespace.regex.match(test_string):
                 return namespace
@@ -165,6 +226,12 @@ class ApplicationService:
         if namespace:
             return namespace.exclusive
         return False
+
+    def _is_proxy_prefix_allowed(self, prefix: str) -> bool:
+        return any(
+            prefix == allowed or prefix.startswith(allowed + "/")
+            for allowed in ApplicationService.ALLOWED_PROXY_PREFIXES
+        )
 
     @cached(num_args=1, cache_context=True)
     async def _matches_user_in_member_list(
@@ -223,7 +290,7 @@ class ApplicationService:
         """
         return (
             # User is the appservice's configured sender_localpart user
-            user_id == self.sender
+            user_id == self.sender.to_string()
             # User is in the appservice's user namespace
             or self.is_user_in_namespace(user_id)
         )
@@ -347,11 +414,14 @@ class ApplicationService:
     def is_exclusive_user(self, user_id: str) -> bool:
         return (
             self._is_exclusive(ApplicationService.NS_USERS, user_id)
-            or user_id == self.sender
+            or user_id == self.sender.to_string()
         )
 
     def is_interested_in_protocol(self, protocol: str) -> bool:
         return protocol in self.protocols
+
+    def has_scope(self, scope: Scopes) -> bool:
+        return scope in self.scopes
 
     def is_exclusive_alias(self, alias: str) -> bool:
         return self._is_exclusive(ApplicationService.NS_ALIASES, alias)
@@ -359,7 +429,7 @@ class ApplicationService:
     def is_exclusive_room(self, room_id: str) -> bool:
         return self._is_exclusive(ApplicationService.NS_ROOMS, room_id)
 
-    def get_exclusive_user_regexes(self) -> List[Pattern[str]]:
+    def get_exclusive_user_regexes(self) -> list[Pattern[str]]:
         """Get the list of regexes used to determine if a user is exclusively
         registered by the AS
         """
@@ -388,8 +458,8 @@ class AppServiceTransaction:
         service: ApplicationService,
         id: int,
         events: Sequence[EventBase],
-        ephemeral: List[JsonMapping],
-        to_device_messages: List[JsonMapping],
+        ephemeral: list[JsonMapping],
+        to_device_messages: list[JsonMapping],
         one_time_keys_count: TransactionOneTimeKeysCount,
         unused_fallback_keys: TransactionUnusedFallbackKeys,
         device_list_summary: DeviceListUpdates,

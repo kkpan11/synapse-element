@@ -2,7 +2,7 @@
 # This file is licensed under the Affero General Public License (AGPL) version 3.
 #
 # Copyright 2023 Tulir Asokan
-# Copyright (C) 2023 New Vector, Ltd
+# Copyright (C) 2023, 2025 New Vector, Ltd
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as
@@ -22,7 +22,7 @@
 import logging
 import time
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Dict, Tuple
+from typing import TYPE_CHECKING, Any
 
 from synapse.api.errors import (
     CodeMessageException,
@@ -46,33 +46,41 @@ logger = logging.getLogger(__name__)
 
 class AppservicePingRestServlet(RestServlet):
     PATTERNS = client_patterns(
-        "/appservice/(?P<appservice_id>[^/]*)/ping",
+        "/appservice/(?P<appservice_id>[^/]*)/ping$",
         releases=("v1",),
     )
 
     def __init__(self, hs: "HomeServer"):
         super().__init__()
         self.as_api = hs.get_application_service_api()
+        self.scheduler = hs.get_application_service_scheduler()
         self.auth = hs.get_auth()
+        self.store = hs.get_datastores().main
 
     async def on_POST(
         self, request: SynapseRequest, appservice_id: str
-    ) -> Tuple[int, JsonDict]:
+    ) -> tuple[int, JsonDict]:
         requester = await self.auth.get_user_by_req(request)
 
-        if not requester.app_service:
+        app_service = (
+            self.store.get_app_service_by_id(requester.app_service_id)
+            if requester.app_service_id
+            else None
+        )
+
+        if not app_service:
             raise SynapseError(
                 HTTPStatus.FORBIDDEN,
                 "Only application services can use the /appservice/ping endpoint",
                 Codes.FORBIDDEN,
             )
-        elif requester.app_service.id != appservice_id:
+        elif app_service.id != appservice_id:
             raise SynapseError(
                 HTTPStatus.FORBIDDEN,
                 "Mismatching application service ID in path",
                 Codes.FORBIDDEN,
             )
-        elif not requester.app_service.url:
+        elif not app_service.url:
             raise SynapseError(
                 HTTPStatus.BAD_REQUEST,
                 "The application service does not have a URL set",
@@ -84,7 +92,11 @@ class AppservicePingRestServlet(RestServlet):
 
         start = time.monotonic()
         try:
-            await self.as_api.ping(requester.app_service, txn_id)
+            await self.as_api.ping(app_service, txn_id)
+
+            # We got a OK response, so if the AS needs to be recovered then lets recover it now.
+            # This sets off a task in the background and so is safe to execute and forget.
+            self.scheduler.txn_ctrl.force_retry(app_service)
         except RequestTimedOutError as e:
             raise SynapseError(
                 HTTPStatus.GATEWAY_TIMEOUT,
@@ -92,7 +104,7 @@ class AppservicePingRestServlet(RestServlet):
                 Codes.AS_PING_CONNECTION_TIMEOUT,
             )
         except CodeMessageException as e:
-            additional_fields: Dict[str, Any] = {"status": e.code}
+            additional_fields: dict[str, Any] = {"status": e.code}
             if isinstance(e, HttpResponseException):
                 try:
                     additional_fields["body"] = e.response.decode("utf-8")

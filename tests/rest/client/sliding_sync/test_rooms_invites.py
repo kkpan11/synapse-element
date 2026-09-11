@@ -15,14 +15,14 @@ import logging
 
 from parameterized import parameterized_class
 
-from twisted.test.proto_helpers import MemoryReactor
+from twisted.internet.testing import MemoryReactor
 
 import synapse.rest.admin
 from synapse.api.constants import EventTypes, HistoryVisibility
 from synapse.rest.client import login, room, sync
 from synapse.server import HomeServer
 from synapse.types import UserID
-from synapse.util import Clock
+from synapse.util.clock import Clock
 
 from tests.rest.client.sliding_sync.test_sliding_sync import SlidingSyncBase
 
@@ -143,7 +143,7 @@ class SlidingSyncRoomsInvitesTestCase(SlidingSyncBase):
             response_body["rooms"][room_id1]["invite_state"],
             [
                 {
-                    "content": {"creator": user2_id, "room_version": "10"},
+                    "content": {"room_version": "11"},
                     "sender": user2_id,
                     "state_key": "",
                     "type": "m.room.create",
@@ -253,7 +253,7 @@ class SlidingSyncRoomsInvitesTestCase(SlidingSyncBase):
             response_body["rooms"][room_id1]["invite_state"],
             [
                 {
-                    "content": {"creator": user2_id, "room_version": "10"},
+                    "content": {"room_version": "11"},
                     "sender": user2_id,
                     "state_key": "",
                     "type": "m.room.create",
@@ -374,7 +374,7 @@ class SlidingSyncRoomsInvitesTestCase(SlidingSyncBase):
             response_body["rooms"][room_id1]["invite_state"],
             [
                 {
-                    "content": {"creator": user2_id, "room_version": "10"},
+                    "content": {"room_version": "11"},
                     "sender": user2_id,
                     "state_key": "",
                     "type": "m.room.create",
@@ -500,7 +500,7 @@ class SlidingSyncRoomsInvitesTestCase(SlidingSyncBase):
             response_body["rooms"][room_id1]["invite_state"],
             [
                 {
-                    "content": {"creator": user2_id, "room_version": "10"},
+                    "content": {"room_version": "11"},
                     "sender": user2_id,
                     "state_key": "",
                     "type": "m.room.create",

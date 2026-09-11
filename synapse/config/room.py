@@ -27,7 +27,7 @@ from synapse.types import JsonDict
 
 from ._base import Config, ConfigError
 
-logger = logging.Logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class RoomDefaultEncryptionTypes:
@@ -48,23 +48,23 @@ class RoomConfig(Config):
             RoomDefaultEncryptionTypes.OFF,
         )
         if encryption_for_room_type == RoomDefaultEncryptionTypes.ALL:
-            self.encryption_enabled_by_default_for_room_presets = [
+            self.encryption_enabled_by_default_for_room_presets = {
                 RoomCreationPreset.PRIVATE_CHAT,
                 RoomCreationPreset.TRUSTED_PRIVATE_CHAT,
                 RoomCreationPreset.PUBLIC_CHAT,
-            ]
+            }
         elif encryption_for_room_type == RoomDefaultEncryptionTypes.INVITE:
-            self.encryption_enabled_by_default_for_room_presets = [
+            self.encryption_enabled_by_default_for_room_presets = {
                 RoomCreationPreset.PRIVATE_CHAT,
                 RoomCreationPreset.TRUSTED_PRIVATE_CHAT,
-            ]
+            }
         elif (
             encryption_for_room_type == RoomDefaultEncryptionTypes.OFF
             or encryption_for_room_type is False
         ):
             # PyYAML translates "off" into False if it's unquoted, so we also need to
             # check for encryption_for_room_type being False.
-            self.encryption_enabled_by_default_for_room_presets = []
+            self.encryption_enabled_by_default_for_room_presets = set()
         else:
             raise ConfigError(
                 "Invalid value for encryption_enabled_by_default_for_room_type"
@@ -85,4 +85,4 @@ class RoomConfig(Config):
 
         # When enabled, users will forget rooms when they leave them, either via a
         # leave, kick or ban.
-        self.forget_on_leave = config.get("forget_rooms_on_leave", False)
+        self.forget_on_leave: bool = config.get("forget_rooms_on_leave", False)
